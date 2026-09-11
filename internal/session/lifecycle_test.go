@@ -80,6 +80,22 @@ func TestBuildPrompt_WithInstructions(t *testing.T) {
 	}
 }
 
+func TestApplyRuntimeStartupFallback_TraeRequiresPrime(t *testing.T) {
+	beacon := ApplyRuntimeStartupFallback(BeaconConfig{Topic: "cold-start"}, config.RuntimeConfigFromPreset(config.AgentTrae))
+	prompt := FormatStartupBeacon(beacon)
+	if !contains(prompt, "Run `gt prime`") {
+		t.Fatalf("Trae startup prompt missing explicit prime instruction: %q", prompt)
+	}
+}
+
+func TestApplyRuntimeStartupFallback_ClaudeUsesHook(t *testing.T) {
+	beacon := ApplyRuntimeStartupFallback(BeaconConfig{Topic: "cold-start"}, config.RuntimeConfigFromPreset(config.AgentClaude))
+	prompt := FormatStartupBeacon(beacon)
+	if contains(prompt, "Run `gt prime`") {
+		t.Fatalf("Claude startup prompt should rely on SessionStart hook: %q", prompt)
+	}
+}
+
 func TestBuildCommand_DefaultAgent(t *testing.T) {
 	cfg := SessionConfig{
 		Role:     "boot",

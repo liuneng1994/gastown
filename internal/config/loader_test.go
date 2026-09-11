@@ -3877,7 +3877,7 @@ func TestBuildArgsWithPromptWarnsOnDroppedPrompt(t *testing.T) {
 //	}
 //
 // Manual test procedure:
-//  1. Set role_agents.mayor to each agent (claude, gemini, codex, kiro, cursor, auggie, amp, opencode)
+//  1. Set role_agents.mayor to each agent (claude, gemini, codex, trae, kiro, cursor, auggie, amp, opencode)
 //  2. Run: gt start
 //  3. Verify mayor starts with correct agent config
 //  4. Run: GT_NUKE_ACKNOWLEDGED=1 gt down --nuke
@@ -3972,7 +3972,7 @@ func TestRoleAgentConfigWithCustomAgent(t *testing.T) {
 }
 
 // TestMultipleAgentTypes tests that various built-in agent presets work correctly.
-// NOTE: Only these are actual built-in presets: claude, gemini, codex, kiro, cursor, auggie, amp, opencode.
+// NOTE: Only these are actual built-in presets: claude, gemini, codex, trae, kiro, cursor, auggie, amp, opencode.
 // Variants like "claude-opus", "claude-haiku", "claude-sonnet" are NOT built-in - they need
 // to be defined as custom agents in TownSettings.Agents if specific model selection is needed.
 func TestMultipleAgentTypes(t *testing.T) {

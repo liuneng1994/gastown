@@ -27,6 +27,8 @@ const (
 	AgentGemini AgentPreset = "gemini"
 	// AgentCodex is OpenAI Codex.
 	AgentCodex AgentPreset = "codex"
+	// AgentTrae is TraeCode CLI, a Codex-derived coding agent.
+	AgentTrae AgentPreset = "trae"
 	// AgentKiro is Kiro CLI.
 	AgentKiro AgentPreset = "kiro"
 	// AgentCursor is Cursor Agent.
@@ -59,7 +61,7 @@ const (
 // Adding a new agent = adding a builtinPresets entry + optional hook installer.
 // No provider-string switch statements should exist outside this registry.
 type AgentPresetInfo struct {
-	// Name is the preset identifier (e.g., "claude", "gemini", "codex", "cursor", "auggie", "amp", "copilot").
+	// Name is the preset identifier (e.g., "claude", "gemini", "codex", "trae", "cursor", "auggie", "amp", "copilot").
 	Name AgentPreset `json:"name"`
 
 	// Command is the CLI binary to invoke.
@@ -87,8 +89,9 @@ type AgentPresetInfo struct {
 	// For codex: "resume" (subcommand)
 	ResumeFlag string `json:"resume_flag,omitempty"`
 
-	// ContinueFlag is the flag for auto-resuming the most recent session.
+	// ContinueFlag contains the arguments for auto-resuming the most recent session.
 	// For claude: "--continue" (--resume without args opens interactive picker)
+	// For trae: "resume --last".
 	// If empty, --resume without a session ID is rejected with a clear error.
 	ContinueFlag string `json:"continue_flag,omitempty"`
 
@@ -297,6 +300,29 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyPromptPrefix: "› ",
 		ReadyDelayMs:      3000,
 		InstructionsFile:  "AGENTS.md",
+	},
+	AgentTrae: {
+		Name:                AgentTrae,
+		Command:             "traecli",
+		Args:                []string{"-c", codexUpdateCheckConfig, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
+		ProcessNames:        []string{"traecli", "traex"},
+		SessionIDEnv:        "", // Trae stores sessions internally and resumes through CLI arguments.
+		ResumeFlag:          "--resume",
+		ContinueFlag:        "resume --last",
+		ResumeStyle:         "flag",
+		SupportsHooks:       false,
+		SupportsForkSession: false,
+		NonInteractive: &NonInteractiveConfig{
+			Subcommand: "exec",
+			OutputFlag: "--json",
+		},
+		PromptMode:       "arg",
+		ReadyDelayMs:     3000,
+		InstructionsFile: "AGENTS.md",
+		ACP: &ACPConfig{
+			Command: "acp",
+			Args:    []string{"serve", "--yolo"},
+		},
 	},
 	AgentKiro: {
 		Name:         AgentKiro,
@@ -536,6 +562,11 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		InstructionsFile:     "CLAUDE.md",
 		HasTurnBoundaryDrain: true,
 	},
+}
+
+var commandPresetAliases = map[string]AgentPreset{
+	"traecli": AgentTrae,
+	"traex":   AgentTrae,
 }
 
 // Registry state with proper synchronization.
@@ -854,11 +885,21 @@ func wrapperFlagsTakeValue(wrapper string) map[string]bool {
 // first, then the canonical builtinPresets so shadowed builtins still resolve.
 // Caller must hold registryMu.
 func lookupProcessNamesByBinary(realBin string) []string {
+	realBin = filepath.Base(realBin)
+	unwrappedBin := strings.TrimPrefix(realBin, "gt-")
+	if alias, ok := commandPresetAliases[unwrappedBin]; ok {
+		if preset := globalRegistry.Agents[string(alias)]; preset != nil && len(preset.ProcessNames) > 0 {
+			return preset.ProcessNames
+		}
+		if preset := builtinPresets[alias]; preset != nil && len(preset.ProcessNames) > 0 {
+			return preset.ProcessNames
+		}
+	}
 	for _, preset := range globalRegistry.Agents {
 		if len(preset.ProcessNames) == 0 {
 			continue
 		}
-		if preset.Command == realBin || filepath.Base(preset.Command) == realBin {
+		if commandMatchesAgent(preset, realBin) {
 			return preset.ProcessNames
 		}
 	}
@@ -866,11 +907,36 @@ func lookupProcessNamesByBinary(realBin string) []string {
 		if len(preset.ProcessNames) == 0 {
 			continue
 		}
-		if preset.Command == realBin || filepath.Base(preset.Command) == realBin {
+		if commandMatchesAgent(preset, realBin) {
 			return preset.ProcessNames
 		}
 	}
 	return nil
+}
+
+func commandMatchesAgent(info *AgentPresetInfo, command string) bool {
+	if info == nil {
+		return false
+	}
+	cmdBase := ""
+	if command != "" {
+		cmdBase = filepath.Base(command)
+	}
+	unwrappedCmdBase := strings.TrimPrefix(cmdBase, "gt-")
+	if info.Command == command ||
+		info.Command == cmdBase ||
+		filepath.Base(info.Command) == cmdBase ||
+		(strings.HasPrefix(cmdBase, "gt-") && filepath.Base(info.Command) == unwrappedCmdBase) ||
+		cmdBase == "" {
+		return true
+	}
+	if alias, ok := commandPresetAliases[cmdBase]; ok && info.Name == alias {
+		return true
+	}
+	if alias, ok := commandPresetAliases[unwrappedCmdBase]; ok && info.Name == alias {
+		return true
+	}
+	return false
 }
 
 // extractWrappedBinary scans wrapper args for the first non-flag token that
@@ -942,19 +1008,13 @@ func ResolveProcessNames(agentName, command string, args ...string) []string {
 	if command != "" {
 		cmdBase = filepath.Base(command)
 	}
-	unwrappedCmdBase := strings.TrimPrefix(cmdBase, "gt-")
 
 	// Check if agentName matches a built-in/registered preset with matching command.
 	// Compare against both the raw command and basename to handle registry entries
 	// that store absolute-path commands (e.g., "/opt/bin/my-tool").
 	info, infoOK := globalRegistry.Agents[agentName]
 	if infoOK {
-		if len(info.ProcessNames) > 0 &&
-			(info.Command == command ||
-				info.Command == cmdBase ||
-				filepath.Base(info.Command) == cmdBase ||
-				(info.Command == unwrappedCmdBase && strings.HasPrefix(cmdBase, "gt-")) ||
-				cmdBase == "") {
+		if len(info.ProcessNames) > 0 && commandMatchesAgent(info, command) {
 			return info.ProcessNames
 		}
 	}
@@ -986,9 +1046,7 @@ func ResolveProcessNames(agentName, command string, args ...string) []string {
 			if len(info.ProcessNames) == 0 {
 				continue
 			}
-			if info.Command == command ||
-				filepath.Base(info.Command) == cmdBase ||
-				(strings.HasPrefix(cmdBase, "gt-") && filepath.Base(info.Command) == unwrappedCmdBase) {
+			if commandMatchesAgent(info, command) {
 				return info.ProcessNames
 			}
 		}
@@ -1037,6 +1095,24 @@ func IsKnownPreset(name string) bool {
 	defer registryMu.Unlock()
 	_, ok := globalRegistry.Agents[name]
 	return ok
+}
+
+// InferAgentProviderFromCommand maps a runtime binary to the preset that should
+// provide its defaults. It handles CLIs whose public command does not exactly
+// match the Gas Town preset name, such as traecli/traex -> trae.
+func InferAgentProviderFromCommand(command string) string {
+	cmdBase := command
+	if command != "" {
+		cmdBase = filepath.Base(command)
+	}
+	cmdBase = strings.TrimPrefix(cmdBase, "gt-")
+	if alias, ok := commandPresetAliases[cmdBase]; ok {
+		return string(alias)
+	}
+	if IsKnownPreset(cmdBase) {
+		return cmdBase
+	}
+	return ""
 }
 
 // SaveAgentRegistry writes the agent registry to a file.
@@ -1109,9 +1185,8 @@ func ResolveACPConfig(agentName, command string) *ACPConfig {
 
 	// 2. Otherwise, find a registered preset whose Command matches and has ACP.
 	if command != "" {
-		cmdBase := filepath.Base(command)
 		for _, info := range globalRegistry.Agents {
-			if (info.Command == command || filepath.Base(info.Command) == cmdBase) && info.ACP != nil && info.ACP.Command != "" {
+			if commandMatchesAgent(info, command) && info.ACP != nil && info.ACP.Command != "" {
 				return info.ACP
 			}
 		}

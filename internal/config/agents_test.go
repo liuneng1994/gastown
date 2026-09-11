@@ -32,7 +32,7 @@ func TestBuiltInAgentPresetSummary(t *testing.T) {
 func TestBuiltinPresets(t *testing.T) {
 	t.Parallel()
 	// Ensure all built-in presets are accessible
-	presets := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentKiro, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi, AgentOmp}
+	presets := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentTrae, AgentKiro, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi, AgentOmp}
 
 	for _, preset := range presets {
 		info := GetAgentPreset(preset)
@@ -62,6 +62,7 @@ func TestGetAgentPresetByName(t *testing.T) {
 		{"claude", AgentClaude, false},
 		{"gemini", AgentGemini, false},
 		{"codex", AgentCodex, false},
+		{"trae", AgentTrae, false},
 		{"kiro", AgentKiro, false},
 		{"cursor", AgentCursor, false},
 		{"auggie", AgentAuggie, false},
@@ -99,6 +100,7 @@ func TestRuntimeConfigFromPreset(t *testing.T) {
 		{AgentClaude, "claude"}, // Note: claude may resolve to full path
 		{AgentGemini, "gemini"},
 		{AgentCodex, "codex"},
+		{AgentTrae, "traecli"},
 		{AgentKiro, "kiro-cli"},
 		{AgentCursor, "cursor-agent"},
 		{AgentAuggie, "auggie"},
@@ -147,6 +149,9 @@ func TestIsKnownPreset(t *testing.T) {
 		{"claude", true},
 		{"gemini", true},
 		{"codex", true},
+		{"trae", true},
+		{"traecli", false}, // Binary alias, not a preset name
+		{"traex", false},   // Binary alias, not a preset name
 		{"cursor", true},
 		{"auggie", true},
 		{"amp", true},
@@ -311,6 +316,24 @@ func TestResolveProcessNames(t *testing.T) {
 			agentName: "codex",
 			command:   "codex",
 			want:      []string{"codex"},
+		},
+		{
+			name:      "trae preset command",
+			agentName: "trae",
+			command:   "traecli",
+			want:      []string{"traecli", "traex"},
+		},
+		{
+			name:      "trae preset via traex alias",
+			agentName: "trae",
+			command:   "traex",
+			want:      []string{"traecli", "traex"},
+		},
+		{
+			name:      "unknown agent with traecli command",
+			agentName: "my-trae-wrapper",
+			command:   "traecli",
+			want:      []string{"traecli", "traex"},
 		},
 		{
 			name:      "built-in preset through gt wrapper command",
@@ -546,6 +569,7 @@ func TestAgentPresetApprovalFlags(t *testing.T) {
 		{AgentClaude, "--dangerously-skip-permissions"},
 		{AgentGemini, "yolo"}, // Part of "--approval-mode yolo"
 		{AgentCodex, "--dangerously-bypass-approvals-and-sandbox"},
+		{AgentTrae, "--dangerously-bypass-approvals-and-sandbox"},
 		{AgentCopilot, "--yolo"},
 	}
 
@@ -636,6 +660,13 @@ func TestBuildResumeCommand(t *testing.T) {
 			contains:  []string{"codex", "resume", "codex-sess-789", "--dangerously-bypass-approvals-and-sandbox"},
 		},
 		{
+			name:      "trae flag style",
+			agentName: "trae",
+			sessionID: "trae-sess-789",
+			wantEmpty: false,
+			contains:  []string{"traecli", "--resume", "trae-sess-789", "--dangerously-bypass-approvals-and-sandbox"},
+		},
+		{
 			name:      "kiro flag style",
 			agentName: "kiro",
 			sessionID: "f2946a26-3735-4b08-8d05-c928010302d5",
@@ -692,6 +723,7 @@ func TestSupportsSessionResume(t *testing.T) {
 		{"claude", true},
 		{"gemini", true},
 		{"codex", true},
+		{"trae", true},
 		{"kiro", true},
 		{"cursor", true},
 		{"auggie", true},
@@ -718,6 +750,7 @@ func TestGetSessionIDEnvVar(t *testing.T) {
 		{"claude", "CLAUDE_SESSION_ID"},
 		{"gemini", "GEMINI_SESSION_ID"},
 		{"codex", ""},   // Codex uses JSONL output instead
+		{"trae", ""},    // Trae stores sessions internally and resumes by CLI flag
 		{"kiro", ""},    // Kiro stores sessions per directory and resumes by CLI flag
 		{"cursor", ""},  // Cursor uses --resume with chatId directly
 		{"auggie", ""},  // Auggie uses --resume directly
@@ -744,6 +777,7 @@ func TestGetProcessNames(t *testing.T) {
 		{"claude", []string{"node", "claude"}},
 		{"gemini", []string{"gemini"}},
 		{"codex", []string{"codex"}},
+		{"trae", []string{"traecli", "traex"}},
 		{"kiro", []string{"kiro-cli"}},
 		{"cursor", []string{"cursor-agent", "agent"}},
 		{"auggie", []string{"auggie"}},
@@ -773,7 +807,7 @@ func TestGetProcessNames(t *testing.T) {
 func TestListAgentPresetsMatchesConstants(t *testing.T) {
 	t.Parallel()
 	// Ensure all AgentPreset constants are returned by ListAgentPresets
-	allConstants := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi, AgentOmp}
+	allConstants := []AgentPreset{AgentClaude, AgentGemini, AgentCodex, AgentTrae, AgentCursor, AgentAuggie, AgentAmp, AgentOpenCode, AgentCopilot, AgentPi, AgentOmp}
 	presets := ListAgentPresets()
 
 	// Convert to map for quick lookup
@@ -819,6 +853,11 @@ func TestAgentCommandGeneration(t *testing.T) {
 			preset:       AgentCodex,
 			wantCommand:  "codex",
 			wantContains: []string{"--dangerously-bypass-approvals-and-sandbox"},
+		},
+		{
+			preset:       AgentTrae,
+			wantCommand:  "traecli",
+			wantContains: []string{"--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"},
 		},
 		{
 			preset:       AgentCursor,
@@ -1445,6 +1484,110 @@ func TestCodexRuntimeConfigHasPromptDetection(t *testing.T) {
 	}
 }
 
+func TestTraeAgentPreset(t *testing.T) {
+	t.Parallel()
+
+	info := GetAgentPreset(AgentTrae)
+	if info == nil {
+		t.Fatal("trae preset not found")
+	}
+
+	if info.Command != "traecli" {
+		t.Errorf("trae command = %q, want traecli", info.Command)
+	}
+
+	wantArgs := []string{"-c", codexUpdateCheckConfig, "--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"}
+	if len(info.Args) != len(wantArgs) {
+		t.Fatalf("trae args = %v, want %v", info.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if info.Args[i] != want {
+			t.Errorf("trae Args[%d] = %q, want %q", i, info.Args[i], want)
+		}
+	}
+
+	wantProcessNames := []string{"traecli", "traex"}
+	if len(info.ProcessNames) != len(wantProcessNames) {
+		t.Fatalf("trae ProcessNames = %v, want %v", info.ProcessNames, wantProcessNames)
+	}
+	for i, want := range wantProcessNames {
+		if info.ProcessNames[i] != want {
+			t.Errorf("trae ProcessNames[%d] = %q, want %q", i, info.ProcessNames[i], want)
+		}
+	}
+
+	if info.ResumeFlag != "--resume" {
+		t.Errorf("trae ResumeFlag = %q, want --resume", info.ResumeFlag)
+	}
+	if info.ContinueFlag != "resume --last" {
+		t.Errorf("trae ContinueFlag = %q, want resume --last", info.ContinueFlag)
+	}
+	if info.ResumeStyle != "flag" {
+		t.Errorf("trae ResumeStyle = %q, want flag", info.ResumeStyle)
+	}
+	if info.SupportsHooks {
+		t.Error("trae should use the safe startup fallback unless project hooks are explicitly trusted")
+	}
+
+	if info.NonInteractive == nil {
+		t.Fatal("trae NonInteractive is nil")
+	}
+	if info.NonInteractive.Subcommand != "exec" {
+		t.Errorf("trae NonInteractive.Subcommand = %q, want exec", info.NonInteractive.Subcommand)
+	}
+	if info.NonInteractive.OutputFlag != "--json" {
+		t.Errorf("trae NonInteractive.OutputFlag = %q, want --json", info.NonInteractive.OutputFlag)
+	}
+
+	if info.ACP == nil {
+		t.Fatal("trae ACP config is nil")
+	}
+	if info.ACP.Command != "acp" {
+		t.Errorf("trae ACP.Command = %q, want acp", info.ACP.Command)
+	}
+	wantACPArgs := []string{"serve", "--yolo"}
+	if len(info.ACP.Args) != len(wantACPArgs) {
+		t.Fatalf("trae ACP.Args = %v, want %v", info.ACP.Args, wantACPArgs)
+	}
+	for i, want := range wantACPArgs {
+		if info.ACP.Args[i] != want {
+			t.Errorf("trae ACP.Args[%d] = %q, want %q", i, info.ACP.Args[i], want)
+		}
+	}
+}
+
+func TestTraeCommandAliasesUseTraeDefaults(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		command string
+	}{
+		{command: "traecli"},
+		{command: "traex"},
+		{command: "/opt/bin/traecli"},
+		{command: "gt-traex"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			if got := InferAgentProviderFromCommand(tt.command); got != string(AgentTrae) {
+				t.Fatalf("InferAgentProviderFromCommand(%q) = %q, want trae", tt.command, got)
+			}
+
+			rc := fillRuntimeDefaults(&RuntimeConfig{Command: tt.command})
+			if rc.Instructions == nil || rc.Instructions.File != "AGENTS.md" {
+				t.Errorf("fillRuntimeDefaults(%q).Instructions = %+v, want AGENTS.md", tt.command, rc.Instructions)
+			}
+			if rc.Tmux == nil || rc.Tmux.ReadyDelayMs != 3000 {
+				t.Errorf("fillRuntimeDefaults(%q).Tmux = %+v, want ReadyDelayMs 3000", tt.command, rc.Tmux)
+			}
+			if rc.ACP == nil || rc.ACP.Command != "acp" {
+				t.Errorf("fillRuntimeDefaults(%q).ACP = %+v, want acp command", tt.command, rc.ACP)
+			}
+		})
+	}
+}
+
 func TestPiProviderDefaults(t *testing.T) {
 	t.Parallel()
 
@@ -1555,6 +1698,12 @@ func TestResolveACPConfig(t *testing.T) {
 			command:   "/usr/local/bin/opencode",
 			wantCmd:   "acp",
 		},
+		{
+			name:      "trae command alias matches built-in preset",
+			agentName: "my-trae-wrapper",
+			command:   "traecli",
+			wantCmd:   "acp",
+		},
 	}
 
 	for _, tt := range tests {
@@ -1612,6 +1761,7 @@ func TestGetACPCommand(t *testing.T) {
 		{"claude", ""},
 		{"gemini", ""},
 		{"codex", ""},
+		{"trae", "acp"},
 		{"cursor", ""},
 		{"auggie", ""},
 		{"amp", ""},

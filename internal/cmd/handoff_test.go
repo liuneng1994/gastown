@@ -431,6 +431,24 @@ func TestBuildRestartCommandWithOpts_ContinuePrompt(t *testing.T) {
 			t.Errorf("expected no --continue flag when ContinueSession is false, got: %q", cmd)
 		}
 	})
+
+	t.Run("Trae uses preset continue flag", func(t *testing.T) {
+		if err := os.Setenv("GT_AGENT", "trae"); err != nil {
+			t.Fatalf("set GT_AGENT: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Setenv("GT_AGENT", "") })
+
+		cmd, err := buildRestartCommandWithOpts("gt-crew-bear", buildRestartCommandOpts{
+			ContinueSession: true,
+			ContinuePrompt:  "Context compacted. Continue your previous task.",
+		})
+		if err != nil {
+			t.Fatalf("buildRestartCommandWithOpts: %v", err)
+		}
+		if !strings.Contains(cmd, "traecli") || !strings.Contains(cmd, "resume --last") {
+			t.Fatalf("expected Trae restart command to resume the previous session, got: %q", cmd)
+		}
+	})
 }
 
 func TestDetectTownRootFromCwd_EnvFallback(t *testing.T) {

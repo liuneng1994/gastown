@@ -400,6 +400,36 @@ func TestConfigAgentSetProviderInference(t *testing.T) {
 		}
 	})
 
+	t.Run("infers Trae provider from binary alias", func(t *testing.T) {
+		townRoot := setupTestTownForConfig(t)
+		settingsPath := config.TownSettingsPath(townRoot)
+
+		originalWd, _ := os.Getwd()
+		defer os.Chdir(originalWd)
+		if err := os.Chdir(townRoot); err != nil {
+			t.Fatalf("chdir: %v", err)
+		}
+
+		configAgentSetProvider = ""
+		cmd := &cobra.Command{}
+		args := []string{"trae-custom", "traex --model test"}
+		if err := runConfigAgentSet(cmd, args); err != nil {
+			t.Fatalf("runConfigAgentSet failed: %v", err)
+		}
+
+		loaded, err := config.LoadOrCreateTownSettings(settingsPath)
+		if err != nil {
+			t.Fatalf("load settings: %v", err)
+		}
+		agent := loaded.Agents["trae-custom"]
+		if agent == nil {
+			t.Fatal("agent not found")
+		}
+		if agent.Provider != "trae" {
+			t.Errorf("Provider = %q, want trae", agent.Provider)
+		}
+	})
+
 	t.Run("no provider inferred for unknown command", func(t *testing.T) {
 		townRoot := setupTestTownForConfig(t)
 		settingsPath := config.TownSettingsPath(townRoot)

@@ -50,7 +50,7 @@ type TownSettings struct {
 	CLITheme string `json:"cli_theme,omitempty"`
 
 	// DefaultAgent is the name of the agent preset to use by default.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
+	// Can be a built-in preset ("claude", "gemini", "codex", "trae", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent name defined in settings/agents.json.
 	// Default: "claude"
 	DefaultAgent string `json:"default_agent,omitempty"`
@@ -678,7 +678,7 @@ type RigSettings struct {
 	Runtime    *RuntimeConfig    `json:"runtime,omitempty"`     // LLM runtime settings (deprecated: use Agent)
 
 	// Agent selects which agent preset to use for this rig.
-	// Can be a built-in preset ("claude", "gemini", "codex", "cursor", "auggie", "amp", "opencode", "copilot")
+	// Can be a built-in preset ("claude", "gemini", "codex", "trae", "cursor", "auggie", "amp", "opencode", "copilot")
 	// or a custom agent defined in settings/agents.json.
 	// If empty, uses the town's default_agent setting.
 	// Takes precedence over Runtime if both are set.
@@ -728,7 +728,8 @@ type CrewConfig struct {
 // without modifying startup code.
 type RuntimeConfig struct {
 	// Provider selects runtime-specific defaults and integration behavior.
-	// Known values: "claude", "codex", "generic". Default: "claude".
+	// Known values: built-in preset names such as "claude", "codex", "trae", or "generic".
+	// Default: "claude".
 	Provider string `json:"provider,omitempty"`
 
 	// Command is the CLI command to invoke (e.g., "claude", "aider").
@@ -962,7 +963,11 @@ func normalizeRuntimeConfig(rc *RuntimeConfig) *RuntimeConfig {
 	}
 
 	if rc.Provider == "" {
-		rc.Provider = "claude"
+		if inferred := InferAgentProviderFromCommand(rc.Command); inferred != "" {
+			rc.Provider = inferred
+		} else {
+			rc.Provider = "claude"
+		}
 	}
 
 	if rc.Command == "" {
@@ -1054,7 +1059,8 @@ func ensureCodexAutomationArgs(command string, args []string) []string {
 }
 
 func isCodexRuntime(command string) bool {
-	return filepath.Base(command) == string(AgentCodex)
+	cmd := strings.TrimPrefix(filepath.Base(command), "gt-")
+	return cmd == string(AgentCodex) || commandPresetAliases[cmd] == AgentTrae
 }
 
 func hasCodexUpdateCheckConfig(args []string) bool {

@@ -586,6 +586,14 @@ func TestEnsureSettingsForRole_CursorUsesWorkDir(t *testing.T) {
 	}
 }
 
+func TestTraeUsesSafeStartupFallback(t *testing.T) {
+	rc := config.RuntimeConfigFromPreset(config.AgentTrae)
+	fallback := GetStartupFallbackInfo(rc)
+	if !fallback.IncludePrimeInBeacon || !fallback.SendStartupNudge {
+		t.Errorf("Trae should use startup fallback without bypassing hook trust: %+v", fallback)
+	}
+}
+
 func TestGetStartupFallbackInfo_InformationalHooks(t *testing.T) {
 	// Copilot: hooks provider set but informational (instructions file, not executable).
 	// Should be treated as having NO hooks for startup fallback purposes.

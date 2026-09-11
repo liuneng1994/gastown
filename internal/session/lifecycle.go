@@ -180,6 +180,7 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	// 3. Build startup command if not provided.
 	command := cfg.Command
 	if command == "" {
+		cfg.Beacon = ApplyRuntimeStartupFallback(cfg.Beacon, runtimeConfig)
 		prompt := buildPrompt(cfg)
 		var err error
 		command, err = buildCommand(cfg, prompt)
@@ -314,6 +315,15 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 		cfg.Role, cfg.AgentName, cfg.SessionID, cfg.RigName, cfg.TownRoot, "", cfg.WorkDir)
 
 	return &StartResult{RuntimeConfig: runtimeConfig, RunID: runID}, nil
+}
+
+// ApplyRuntimeStartupFallback marks a startup beacon to initialize context
+// explicitly when the selected runtime has no executable SessionStart hook.
+func ApplyRuntimeStartupFallback(beacon BeaconConfig, runtimeConfig *config.RuntimeConfig) BeaconConfig {
+	if runtime.GetStartupFallbackInfo(runtimeConfig).IncludePrimeInBeacon {
+		beacon.IncludePrimeInstruction = true
+	}
+	return beacon
 }
 
 // RecordAgentInstantiateFromDir resolves the git branch/commit from workDir and

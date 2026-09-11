@@ -425,13 +425,7 @@ func runConfigAgentSet(cmd *cobra.Command, args []string) error {
 	// from the command binary name if it matches a known preset.
 	provider := configAgentSetProvider
 	if provider == "" {
-		cmdBase := parts[0]
-		if idx := strings.LastIndexByte(cmdBase, '/'); idx >= 0 {
-			cmdBase = cmdBase[idx+1:]
-		}
-		if config.IsKnownPreset(cmdBase) {
-			provider = cmdBase
-		}
+		provider = config.InferAgentProviderFromCommand(parts[0])
 	}
 
 	// Create or update the agent

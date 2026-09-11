@@ -27,6 +27,7 @@ Native source installs require these host tools. Homebrew and Docker installs pr
 | **tmux** | 3.0+ | `tmux -V` | See below |
 | **Claude Code** (default) | >= 2.0.20 | `claude --version` | See [claude.ai/claude-code](https://claude.ai/claude-code) |
 | **Codex CLI** (optional) | latest | `codex --version` | See [developers.openai.com/codex/cli](https://developers.openai.com/codex/cli) |
+| **TraeCode CLI** (optional) | latest | `traecli --version` | Install TraeCode CLI for the `trae` runtime |
 | **OpenCode CLI** (optional) | latest | `opencode --version` | See [opencode.ai](https://opencode.ai) |
 | **GitHub Copilot CLI** (optional) | latest | `copilot --version` | See [cli.github.com](https://cli.github.com) (requires Copilot seat) |
 
@@ -195,7 +196,7 @@ gt status              # Show workspace status
 
 ### Step 5: Configure Agents (Optional)
 
-Gas Town supports built-in runtimes (`claude`, `gemini`, `codex`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`) plus custom agent aliases.
+Gas Town supports built-in runtimes (`claude`, `gemini`, `codex`, `trae`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`) plus custom agent aliases.
 
 ```bash
 # List available agents
@@ -233,6 +234,7 @@ gt sling gt-abc12 myproject
 cd ~/gt/myproject/polecats/<worker>
 claude --resume          # Claude Code
 # or: codex              # Codex CLI
+# or: traecli            # TraeCode CLI
 
 # Check progress
 gt convoy list

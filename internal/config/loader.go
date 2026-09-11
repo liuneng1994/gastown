@@ -1119,7 +1119,7 @@ func SaveTownSettings(path string, settings *TownSettings) error {
 //  1. If rig has Runtime set directly, use it (backwards compatibility)
 //  2. If rig has Agent set, look it up in:
 //     a. Town's custom agents (from TownSettings.Agents)
-//     b. Built-in presets (claude, gemini, codex)
+//     b. Built-in presets (claude, gemini, codex, trae)
 //  3. If rig has no Agent set, use town's default_agent
 //  4. Fall back to claude defaults
 //
@@ -1943,7 +1943,10 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	// Use provider if set, otherwise try to match by command name.
 	presetName := result.Provider
 	if presetName == "" && result.Command != "" {
-		presetName = result.Command
+		presetName = InferAgentProviderFromCommand(result.Command)
+		if presetName == "" {
+			presetName = result.Command
+		}
 	}
 	preset := GetAgentPresetByName(presetName)
 	if preset == nil {

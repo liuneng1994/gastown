@@ -461,7 +461,7 @@ gt config agent remove <name>     # Remove custom agent (built-ins protected)
 gt config default-agent [name]    # Get or set town default agent
 ```
 
-**Built-in agents**: `claude`, `gemini`, `codex`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`
+**Built-in agents**: `claude`, `gemini`, `codex`, `trae`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`
 
 The `kiro` preset launches `kiro-cli chat --trust-all-tools` and uses Kiro's
 documented `--resume` / `--resume-id` session flags. Gas Town does not install

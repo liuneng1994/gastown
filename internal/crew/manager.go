@@ -716,6 +716,13 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	// Settings are passed to Claude Code via --settings flag.
 	townRoot := filepath.Dir(m.rig.Path)
 	runtimeConfig := config.ResolveWorkerAgentConfig(name, townRoot, m.rig.Path)
+	if opts.AgentOverride != "" {
+		overridden, _, resolveErr := config.ResolveAgentConfigWithOverride(townRoot, m.rig.Path, opts.AgentOverride)
+		if resolveErr != nil {
+			return fmt.Errorf("resolving agent config for %s: %w", opts.AgentOverride, resolveErr)
+		}
+		runtimeConfig = overridden
+	}
 	crewSettingsDir := config.RoleSettingsDir("crew", m.rig.Path)
 	if err := runtime.EnsureSettingsForRole(crewSettingsDir, worker.ClonePath, "crew", runtimeConfig); err != nil {
 		return fmt.Errorf("ensuring runtime settings: %w", err)
@@ -737,7 +744,8 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 
 	// Build startup command (also includes env vars via 'exec env' for
 	// WaitForCommand detection — belt and suspenders with -e flags)
-	// SessionStart hook handles context loading (gt prime --hook)
+	// SessionStart hooks handle context loading when available; runtimes without
+	// executable hooks receive an explicit gt prime instruction in the beacon.
 	//
 	// IMPORTANT: All validation and command building happens BEFORE killing
 	// any existing session, so a validation failure cannot leave the user
@@ -781,11 +789,13 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 		if topic == "" {
 			topic = "start"
 		}
-		beacon := session.FormatStartupBeacon(session.BeaconConfig{
+		beaconConfig := session.BeaconConfig{
 			Recipient: address,
 			Sender:    "human",
 			Topic:     topic,
-		})
+		}
+		beaconConfig = session.ApplyRuntimeStartupFallback(beaconConfig, runtimeConfig)
+		beacon := session.FormatStartupBeacon(beaconConfig)
 		claudeCmd, err = config.BuildStartupCommandFromConfig(config.AgentEnvConfig{
 			Role:        "crew",
 			Rig:         m.rig.Name,

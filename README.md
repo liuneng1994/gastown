@@ -471,9 +471,9 @@ Gas Town supports multiple AI coding runtimes. Per-rig runtime settings are in `
 - Claude uses hooks in `.claude/settings.json` (managed via `--settings` flag) for mail injection and startup.
 - For Codex, set `project_doc_fallback_filenames = ["CLAUDE.md"]` in
   `~/.codex/config.toml` so role instructions are picked up.
-- For runtimes without hooks (e.g., Codex), Gas Town sends a startup fallback
-  after the session is ready: `gt prime`, optional `gt mail check --inject`
-  for autonomous roles, and `gt nudge deacon session-started`.
+- For runtimes without hooks (e.g., Codex and Trae), Gas Town includes an
+  explicit `gt prime` instruction in the startup prompt. Autonomous role paths
+  may also send a delayed startup nudge after the runtime is ready.
 - **GitHub Copilot** (`copilot`) is a built-in preset using `--yolo` for autonomous
   mode. It uses executable lifecycle hooks in `.github/hooks/gastown.json` (same events
   as Claude: `sessionStart`, `userPromptSubmitted`, `preToolUse`, `sessionEnd`). Uses a
@@ -504,7 +504,7 @@ gt feed                     # Real-time activity feed (TUI)
 gt feed --problems          # Start in problems view (stuck agent detection)
 ```
 
-**Built-in agent presets**: `claude`, `gemini`, `codex`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`, `pi`, `omp`
+**Built-in agent presets**: `claude`, `gemini`, `codex`, `trae`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`, `pi`, `omp`
 
 The `kiro` preset launches `kiro-cli chat --trust-all-tools`, supports Kiro's
 documented `--resume` / `--resume-id` session flags, and does not install Kiro

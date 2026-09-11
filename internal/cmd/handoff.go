@@ -868,32 +868,27 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 			currentAgent = val
 		}
 	}
-	var runtimeCmd string
+	var runtimeConfig *config.RuntimeConfig
 	if currentAgent != "" {
 		var err error
-		runtimeCmd, err = config.GetRuntimeCommandWithPromptAndAgentOverride(rigPath, beacon, currentAgent)
+		runtimeConfig, _, err = config.ResolveAgentConfigWithOverride(townRoot, rigPath, currentAgent)
 		if err != nil {
 			return "", fmt.Errorf("resolving agent config: %w", err)
 		}
 	} else if simpleRole != "" {
 		// Preserve role_agents model selection across self-handoff by resolving
 		// runtime command via role-aware config (instead of default-agent lookup).
-		runtimeCmd = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath).BuildCommandWithPrompt(beacon)
+		runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
 	} else {
-		runtimeCmd = config.GetRuntimeCommandWithPrompt(rigPath, beacon)
+		runtimeConfig = config.ResolveAgentConfig(townRoot, rigPath)
 	}
 
-	// Add --continue flag to resume the most recent session.
-	// Note: runtimeCmd starts with the command name (e.g., "claude --settings ..."),
-	// not "exec claude" — the "exec" prefix is added later in the Sprintf.
 	if opts.ContinueSession {
-		// Handle both Unix ("claude ") and Windows ("claude.exe ") binary names
-		if n := strings.Replace(runtimeCmd, "claude.exe ", "claude.exe --continue ", 1); n != runtimeCmd {
-			runtimeCmd = n
-		} else {
-			runtimeCmd = strings.Replace(runtimeCmd, "claude ", "claude --continue ", 1)
+		if continueFlag := continueFlagForRuntime(currentAgent, runtimeConfig); continueFlag != "" {
+			runtimeConfig.Args = append(runtimeConfig.Args, strings.Fields(continueFlag)...)
 		}
 	}
+	runtimeCmd := runtimeConfig.BuildCommandWithPrompt(beacon)
 
 	// Build environment variables map — role vars first, then Claude vars.
 	// Uses config.PrependEnv for OS-aware export syntax (bash export on
@@ -901,22 +896,6 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 	envMap := make(map[string]string)
 	var agentEnv map[string]string // agent config Env (rc.toml [agents.X.env])
 	if gtRole != "" {
-		// When GT_AGENT is set, resolve config with the override so we pick up
-		// the active agent's env (e.g., NODE_OPTIONS from [agents.X.env]).
-		// Otherwise, fall back to role-based resolution.
-		var runtimeConfig *config.RuntimeConfig
-		if currentAgent != "" {
-			rc, _, err := config.ResolveAgentConfigWithOverride(townRoot, rigPath, currentAgent)
-			if err == nil {
-				runtimeConfig = rc
-			} else {
-				runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
-			}
-		} else if simpleRole != "" {
-			runtimeConfig = config.ResolveRoleAgentConfig(simpleRole, townRoot, rigPath)
-		} else {
-			runtimeConfig = config.ResolveAgentConfig(townRoot, rigPath)
-		}
 		agentEnv = runtimeConfig.Env
 		envMap["GT_ROLE"] = gtRole
 		envMap["BD_ACTOR"] = gtRole
@@ -991,6 +970,26 @@ func buildRestartCommandWithOpts(sessionName string, opts buildRestartCommandOpt
 
 	envCmd := config.PrependEnv(execPrefix+runtimeCmd, envMap)
 	return cdPrefix + envCmd, nil
+}
+
+func continueFlagForRuntime(agentName string, runtimeConfig *config.RuntimeConfig) string {
+	if runtimeConfig == nil {
+		return ""
+	}
+
+	candidates := []string{agentName, runtimeConfig.ResolvedAgent, runtimeConfig.Provider}
+	if inferred := config.InferAgentProviderFromCommand(runtimeConfig.Command); inferred != "" {
+		candidates = append(candidates, inferred)
+	}
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if preset := config.GetAgentPresetByName(candidate); preset != nil && preset.ContinueFlag != "" {
+			return preset.ContinueFlag
+		}
+	}
+	return ""
 }
 
 // updateSessionEnvForHandoff updates the tmux session environment with the
