@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/dog"
@@ -270,6 +273,98 @@ func TestDogDone_WorkingToIdle(t *testing.T) {
 	}
 	if d.Work != "" {
 		t.Errorf("After ClearWork: Work = %q, want empty", d.Work)
+	}
+}
+
+func TestDogDoneCommandRoutesToDogLifecycleForDogActor(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+	}{
+		{name: "auto-detect dog name", args: []string{"dog", "done"}},
+		{name: "explicit dog name", args: []string{"dog", "done", "alpha"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("BD_ACTOR", "dog")
+
+			townRoot := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"name":"test-town"}`), 0644); err != nil {
+				t.Fatal(err)
+			}
+			rigsPath := filepath.Join(townRoot, "mayor", "rigs.json")
+			if err := config.SaveRigsConfig(rigsPath, &config.RigsConfig{
+				Version: config.CurrentRigsVersion,
+				Rigs: map[string]config.RigEntry{
+					"gastown": {GitURL: "git@example.com:gastown.git"},
+				},
+			}); err != nil {
+				t.Fatalf("save rigs config: %v", err)
+			}
+
+			now := time.Now()
+			setupTestDog(t, nil, townRoot, "alpha", &dog.DogState{
+				Name:          "alpha",
+				State:         dog.StateWorking,
+				Work:          "mol-dog-reaper",
+				WorkStartedAt: now,
+				LastActive:    now,
+				Worktrees: map[string]string{
+					"gastown": filepath.Join(townRoot, "deacon", "dogs", "alpha", "gastown"),
+				},
+				CreatedAt: now,
+				UpdatedAt: now,
+			})
+
+			dogWorktree := filepath.Join(townRoot, "deacon", "dogs", "alpha", "gastown")
+			if err := os.MkdirAll(dogWorktree, 0755); err != nil {
+				t.Fatal(err)
+			}
+			origDir, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chdir(dogWorktree); err != nil {
+				t.Fatalf("chdir dog worktree: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Chdir(origDir) })
+
+			root := &cobra.Command{
+				Use:               "gt",
+				PersistentPreRunE: persistentPreRun,
+			}
+			dogCommand := &cobra.Command{Use: "dog"}
+			dogDoneCommand := *dogDoneCmd
+			dogCommand.AddCommand(&dogDoneCommand)
+			root.AddCommand(dogCommand)
+			root.SetArgs(tt.args)
+			var out bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&out)
+
+			if err := root.Execute(); err != nil {
+				t.Fatalf("gt %s error = %v\noutput:\n%s", strings.Join(tt.args, " "), err, out.String())
+			}
+
+			mgr := dog.NewManager(townRoot, &config.RigsConfig{})
+			d, err := mgr.Get("alpha")
+			if err != nil {
+				t.Fatalf("get dog alpha: %v", err)
+			}
+			if d.State != dog.StateIdle {
+				t.Fatalf("dog state = %q, want %q", d.State, dog.StateIdle)
+			}
+			if d.Work != "" {
+				t.Fatalf("dog work = %q, want empty", d.Work)
+			}
+			if strings.Contains(out.String(), "gt done is for polecats only") {
+				t.Fatalf("dog done routed through polecat done guard:\n%s", out.String())
+			}
+		})
 	}
 }
 
