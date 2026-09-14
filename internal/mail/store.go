@@ -62,7 +62,13 @@ func mailStoreCtx() (context.Context, context.CancelFunc) {
 func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeListFromDirContext(ctx)
+}
 
+func (m *Mailbox) storeListFromDirContext(ctx context.Context) ([]*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	identities := m.identityVariants()
 
 	seen := make(map[string]bool)
@@ -72,6 +78,9 @@ func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 	// so that a single query returns both "open" and "hooked" messages,
 	// avoiding a redundant second round-trip per identity variant.
 	for _, id := range identities {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		filter := beadsdk.IssueFilter{
 			Labels:   []string{"gt:message"},
 			Assignee: &id,
@@ -80,6 +89,9 @@ func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 
 		sdkIssues, err := m.store.SearchIssues(ctx, "", filter)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
 			return nil, fmt.Errorf("store list messages: %w", err)
 		}
 
@@ -101,9 +113,18 @@ func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 func (m *Mailbox) storeGetFromDir(id string) (*Message, error) {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeGetFromDirContext(ctx, id)
+}
 
+func (m *Mailbox) storeGetFromDirContext(ctx context.Context, id string) (*Message, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	si, err := m.store.GetIssue(ctx, id)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if strings.Contains(err.Error(), "not found") {
 			return nil, ErrMessageNotFound
 		}
@@ -137,9 +158,18 @@ func (m *Mailbox) storeCloseInDir(id string) error {
 func (m *Mailbox) storeMarkReadOnly(id string) error {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeMarkReadOnlyContext(ctx, id)
+}
 
+func (m *Mailbox) storeMarkReadOnlyContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err := m.store.AddLabel(ctx, id, "read", "")
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if strings.Contains(err.Error(), "not found") {
 			return ErrMessageNotFound
 		}
@@ -182,6 +212,61 @@ func (m *Mailbox) storeAcknowledgeDeliveryForPrimary(id string) error {
 		return nil
 	}
 	if err := m.store.RemoveLabel(ctx, id, DeliveryLabelPending, ""); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return ErrMessageNotFound
+		}
+		if strings.Contains(err.Error(), "does not have label") {
+			return nil
+		}
+		return fmt.Errorf("store delivery convergence: %w", err)
+	}
+	return nil
+}
+
+func (m *Mailbox) storeAcknowledgeDeliveryForPrimaryMessage(msg *Message) error {
+	ctx, cancel := mailStoreCtx()
+	defer cancel()
+	return m.storeAcknowledgeDeliveryForPrimaryMessageContext(ctx, msg)
+}
+
+func (m *Mailbox) storeAcknowledgeDeliveryForPrimaryMessageContext(ctx context.Context, msg *Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if msg == nil || msg.ID == "" {
+		return ErrMessageNotFound
+	}
+	if msg.DeliveryState == "" || AddressToIdentity(msg.To) != m.identity {
+		return nil
+	}
+
+	toWrite := deliveryAckLabelsToWrite(m.identity, timeNow().UTC(), deliveryLabelsFromMessage(msg))
+	for _, label := range toWrite {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := m.store.AddLabel(ctx, msg.ID, label, ""); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			if strings.Contains(err.Error(), "not found") {
+				return ErrMessageNotFound
+			}
+			return fmt.Errorf("store delivery ack: %w", err)
+		}
+	}
+
+	labelsAfterAck := append(append([]string{}, deliveryLabelsFromMessage(msg)...), toWrite...)
+	if !deliveryPendingRemovalNeeded(labelsAfterAck) {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.store.RemoveLabel(ctx, msg.ID, DeliveryLabelPending, ""); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if strings.Contains(err.Error(), "not found") {
 			return ErrMessageNotFound
 		}

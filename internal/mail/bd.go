@@ -71,7 +71,7 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 
 	cmd := exec.CommandContext(ctx, "bd", args...) //nolint:gosec // G204: bd is a trusted internal tool
 	cmd.Dir = workDir
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 
 	cmd.Env = bdSubprocessEnv(cmd.Environ(), beadsDir, beads.ArgsAreReadOnly(args), extraEnv)
 
@@ -94,7 +94,7 @@ func runBdCommand(ctx context.Context, args []string, workDir, beadsDir string, 
 		stderr.Reset()
 		retryCmd := exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
 		retryCmd.Dir = workDir
-		util.SetDetachedProcessGroup(retryCmd)
+		util.SetProcessGroup(retryCmd)
 		retryCmd.Env = cmd.Env
 		retryCmd.Stdout = &stdout
 		retryCmd.Stderr = &stderr
