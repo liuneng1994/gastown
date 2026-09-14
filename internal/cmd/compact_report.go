@@ -692,6 +692,7 @@ func findExistingWeeklyRollup(weekStart, weekEnd string) (string, error) {
 
 	listCmd := exec.Command("bd", "list",
 		"--type=event",
+		"--status=closed",
 		"--json",
 		"--limit=20",
 	)

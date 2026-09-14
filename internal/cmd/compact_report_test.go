@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
@@ -583,6 +584,120 @@ func TestRunWeeklyRollupStopsBeforeMailWhenAuditCloseFails(t *testing.T) {
 		t.Fatalf("error = %v, want auto-close failure", err)
 	}
 	assertNoMailSent(t, mailLog)
+}
+
+func TestRunWeeklyRollupSuppressesSecondSendUsingClosedAuditEvent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell script command stubs not supported on Windows")
+	}
+
+	binDir := t.TempDir()
+	tmpDir := t.TempDir()
+	mailLog := filepath.Join(tmpDir, "mail.log")
+	stateFile := filepath.Join(tmpDir, "weekly-created")
+	createLog := filepath.Join(tmpDir, "create.log")
+	listLog := filepath.Join(tmpDir, "list.log")
+
+	now := time.Now().UTC()
+	weekEnd := now.Format("2006-01-02")
+	weekStart := now.AddDate(0, 0, -7).Format("2006-01-02")
+	weeklyTitle := "Weekly Compaction Rollup " + weekStart + " to " + weekEnd
+
+	bdScript := `#!/bin/sh
+case "$1" in
+  list)
+    printf '%s\n' "$*" >> "$LIST_LOG"
+    case "$*" in
+      *"--limit=20"* )
+        case "$*" in
+          *"--status=closed"* )
+            if [ -f "$STATE_FILE" ]; then
+              printf '[{"id":"h25-weekly","title":"%s"}]\n' "$WEEKLY_TITLE"
+            else
+              printf '[]\n'
+            fi
+            ;;
+          * )
+            printf '[]\n'
+            ;;
+        esac
+        ;;
+      *"--limit=0"* )
+        printf '[]\n'
+        ;;
+      * )
+        printf '[]\n'
+        ;;
+    esac
+    ;;
+  create)
+    echo "$*" >> "$CREATE_LOG"
+    touch "$STATE_FILE"
+    printf 'h25-weekly\n'
+    ;;
+  close)
+    exit 0
+    ;;
+  *)
+    echo "unexpected bd command: $*" >&2
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(bdScript), 0755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	gtScript := `#!/bin/sh
+if [ "$1" = "mail" ]; then
+  echo "$*" >> "$MAIL_LOG"
+  exit 0
+fi
+echo "unexpected gt command: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "gt"), []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write fake gt: %v", err)
+	}
+
+	resetCompactReportFlags(t)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MAIL_LOG", mailLog)
+	t.Setenv("STATE_FILE", stateFile)
+	t.Setenv("CREATE_LOG", createLog)
+	t.Setenv("LIST_LOG", listLog)
+	t.Setenv("WEEKLY_TITLE", weeklyTitle)
+
+	if err := runWeeklyRollup(); err != nil {
+		t.Fatalf("first runWeeklyRollup: %v", err)
+	}
+	if err := runWeeklyRollup(); err != nil {
+		t.Fatalf("second runWeeklyRollup: %v", err)
+	}
+
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil {
+		t.Fatalf("read mail log: %v", err)
+	}
+	if got := strings.Count(string(mailData), "send mayor/"); got != 1 {
+		t.Fatalf("mail sends = %d, want 1; log:\n%s", got, string(mailData))
+	}
+
+	createData, err := os.ReadFile(createLog)
+	if err != nil {
+		t.Fatalf("read create log: %v", err)
+	}
+	if got := strings.Count(string(createData), "create "); got != 1 {
+		t.Fatalf("weekly audit creates = %d, want 1; log:\n%s", got, string(createData))
+	}
+
+	listData, err := os.ReadFile(listLog)
+	if err != nil {
+		t.Fatalf("read list log: %v", err)
+	}
+	if !strings.Contains(string(listData), "--status=closed") {
+		t.Fatalf("weekly idempotency list args = %q, want --status=closed", string(listData))
+	}
 }
 
 func resetCompactReportFlags(t *testing.T) {
