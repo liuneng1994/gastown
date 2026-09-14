@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -39,36 +41,51 @@ func listBeadsAcrossTables(b *beads.Beads, opts beads.ListOptions) ([]*beads.Iss
 }
 
 func listAssignedActiveWork(b *beads.Beads, assignee string) ([]*beads.Issue, error) {
-	for _, status := range activeWorkStatuses() {
-		beadsForStatus, err := listBeadsAcrossTables(b, beads.ListOptions{
-			Status:   status,
-			Assignee: assignee,
-			Priority: -1,
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(beadsForStatus) > 0 {
-			return beadsForStatus, nil
-		}
+	return listAssignedActiveWorkContext(context.Background(), b, assignee)
+}
+
+func listAssignedActiveWorkContext(ctx context.Context, b *beads.Beads, assignee string) ([]*beads.Issue, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return nil, nil
+	active, err := b.ListAssignedStatusesContext(ctx, assignee, beads.IssueStatusHooked, beads.StatusInProgress)
+	if err != nil {
+		return nil, err
+	}
+	return selectAssignedActiveWork(active), nil
 }
 
 func listAssignedActiveWorkAcrossStatuses(b *beads.Beads, assignee string) ([]*beads.Issue, error) {
-	var assigned []*beads.Issue
-	for _, status := range activeWorkStatuses() {
-		beadsForStatus, err := listBeadsAcrossTables(b, beads.ListOptions{
-			Status:   status,
-			Assignee: assignee,
-			Priority: -1,
-		})
-		if err != nil {
-			return nil, err
-		}
-		assigned = append(assigned, beadsForStatus...)
+	active, err := b.ListAssignedStatuses(assignee, beads.IssueStatusHooked, beads.StatusInProgress)
+	if err != nil {
+		return nil, err
 	}
-	return mergeBeadLists(assigned, nil), nil
+	return mergeBeadLists(active, nil), nil
+}
+
+func listHookedWorkWithFallbacks(b *beads.Beads, workDir, townRoot, target string) ([]*beads.Issue, error) {
+	hookedBeads, err := listAssignedActiveWork(b, target)
+	if err != nil {
+		return nil, err
+	}
+	if len(hookedBeads) > 0 || townRoot == "" {
+		return hookedBeads, nil
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if cleanedWorkDir, cleanedTown := filepath.Clean(workDir), filepath.Clean(townRoot); cleanedWorkDir != cleanedTown {
+		if _, err := os.Stat(townBeadsDir); err == nil {
+			townB := beads.New(townBeadsDir)
+			if townWork, err := listAssignedActiveWork(townB, target); err == nil && len(townWork) > 0 {
+				return townWork, nil
+			}
+		}
+	}
+
+	if isTownLevelRole(target) {
+		return scanAllRigsForHookedBeads(townRoot, target), nil
+	}
+	return nil, nil
 }
 
 func listChildrenAcrossTables(b *beads.Beads, parentID string) ([]*beads.Issue, error) {
@@ -148,6 +165,26 @@ func mergeBeadLists(primary, secondary []*beads.Issue) []*beads.Issue {
 		return beadSortID(merged[i]) > beadSortID(merged[j])
 	})
 	return merged
+}
+
+func selectAssignedActiveWork(issues []*beads.Issue) []*beads.Issue {
+	var hooked []*beads.Issue
+	var inProgress []*beads.Issue
+	for _, issue := range issues {
+		if issue == nil {
+			continue
+		}
+		switch issue.Status {
+		case beads.StatusHooked:
+			hooked = append(hooked, issue)
+		case string(beads.StatusInProgress):
+			inProgress = append(inProgress, issue)
+		}
+	}
+	if len(hooked) > 0 {
+		return mergeBeadLists(hooked, nil)
+	}
+	return mergeBeadLists(inProgress, nil)
 }
 
 func beadRecencyTime(issue *beads.Issue) time.Time {

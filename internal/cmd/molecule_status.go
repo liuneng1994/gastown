@@ -1,12 +1,15 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -405,25 +408,9 @@ func runMoleculeStatus(cmd *cobra.Command, args []string) error {
 		}
 
 		// Query for active work using the authoritative source: bead status + assignee.
-		hookedBeads, err := listAssignedActiveWork(b, target)
+		hookedBeads, err := listHookedWorkWithFallbacks(b, workDir, townRoot, target)
 		if err != nil {
 			return nil
-		}
-
-		// For town-level roles (mayor, deacon), scan all rigs if nothing found locally
-		if len(hookedBeads) == 0 && isTownLevelRole(target) {
-			hookedBeads = scanAllRigsForHookedBeads(townRoot, target)
-		}
-
-		// For rig-level agents (polecats, crew), also search town-level beads.
-		// When the Mayor slings an hq-* bead to a polecat, the bead lives in
-		// townRoot/.beads, not the rig's .beads database.
-		// See: https://github.com/steveyegge/gastown/issues/1438
-		if len(hookedBeads) == 0 && !isTownLevelRole(target) && townRoot != "" {
-			townB := beads.New(filepath.Join(townRoot, ".beads"))
-			if townWork, err := listAssignedActiveWork(townB, target); err == nil && len(townWork) > 0 {
-				hookedBeads = townWork
-			}
 		}
 
 		if len(hookedBeads) > 0 {
@@ -1172,8 +1159,26 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 		return nil
 	}
 
-	// Scan each rig's beads directory
-	for _, route := range routes {
+	scanCtx, cancel := context.WithTimeout(context.Background(), resolveHookCrossRigScanTimeout())
+	defer cancel()
+
+	type scanResult struct {
+		index int
+		work  []*beads.Issue
+	}
+	type scanTask struct {
+		index int
+		dir   string
+	}
+	tasks := make([]scanTask, 0, len(routes))
+
+	// Build the scan list in routes.jsonl order, skipping town beads because
+	// callers already checked the local town database before this fallback.
+	for idx, route := range routes {
+		if filepath.Clean(route.Path) == "." {
+			continue
+		}
+
 		// Handle both absolute and relative paths in routes.jsonl
 		// Go's filepath.Join doesn't replace with absolute paths like Python
 		var rigBeadsDir string
@@ -1185,17 +1190,78 @@ func scanAllRigsForHookedBeads(townRoot, target string) []*beads.Issue {
 		if _, err := os.Stat(rigBeadsDir); os.IsNotExist(err) {
 			continue
 		}
+		tasks = append(tasks, scanTask{index: idx, dir: rigBeadsDir})
+	}
 
-		b := beads.New(rigBeadsDir)
-		hookedBeads, err := listAssignedActiveWork(b, target)
-		if err != nil {
-			continue
-		}
+	results := make(chan scanResult, len(tasks))
+	var wg sync.WaitGroup
 
-		if len(hookedBeads) > 0 {
-			return hookedBeads
+	for taskIndex, task := range tasks {
+		wg.Add(1)
+		go func(index int, dir string) {
+			defer wg.Done()
+			hookedBeads, _ := listAssignedActiveWorkContext(scanCtx, beads.New(dir), target)
+			select {
+			case results <- scanResult{index: index, work: hookedBeads}:
+			case <-scanCtx.Done():
+			}
+		}(taskIndex, task.dir)
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	bestIndex := len(tasks)
+	var best []*beads.Issue
+	completed := make([]bool, len(tasks))
+	completedCount := 0
+	for completedCount < len(tasks) {
+		select {
+		case <-scanCtx.Done():
+			return best
+		case result, ok := <-results:
+			if !ok {
+				return best
+			}
+			if result.index < 0 || result.index >= len(tasks) {
+				continue
+			}
+			if !completed[result.index] {
+				completed[result.index] = true
+				completedCount++
+			}
+			if len(result.work) > 0 && result.index < bestIndex {
+				bestIndex = result.index
+				best = result.work
+			}
+			if best != nil && routeScanPrefixComplete(completed, bestIndex) {
+				cancel()
+				return best
+			}
 		}
 	}
 
-	return nil
+	return best
+}
+
+func routeScanPrefixComplete(completed []bool, before int) bool {
+	for i := 0; i < before; i++ {
+		if !completed[i] {
+			return false
+		}
+	}
+	return true
+}
+
+var hookCrossRigScanTimeout = 5 * time.Second
+
+func resolveHookCrossRigScanTimeout() time.Duration {
+	if v := os.Getenv("GT_HOOK_CROSS_RIG_SCAN_TIMEOUT_MS"); v != "" {
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return hookCrossRigScanTimeout
 }
