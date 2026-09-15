@@ -119,15 +119,16 @@ func TestApplyMQCheck(t *testing.T) {
 	}{
 		{
 			// The regression this change fixes: assigned bead is CLOSED
-			// (e.g. aa-xtee no-op audit). Must NOT return NEEDS_MQ_SUBMIT
-			// because there is nothing to submit — the work is terminal.
+			// (e.g. aa-xtee no-op audit). Must NOT return NEEDS_MQ_SUBMIT:
+			// canonical recovery/nuke policy treats terminal source work as
+			// not requiring the local merge queue.
 			name:           "closed bead skips MQ submit check",
 			finder:         fakeMRFinder{issue: nil, err: nil},
 			beadTerminal:   true,
 			hasWork:        true,
 			initialVerdict: "SAFE_TO_NUKE",
 			wantVerdict:    "SAFE_TO_NUKE",
-			wantMQStatus:   "submitted",
+			wantMQStatus:   "not_required",
 			wantNeedsRecov: false,
 		},
 		{
@@ -665,6 +666,62 @@ func TestDisplaySafetyCheckBlockedToIncludesPredicates(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("displaySafetyCheckBlockedTo() missing %q in %q", want, out)
 		}
+	}
+}
+
+func TestApplyRecoveryStatusToSafetyResultUsesCanonicalVerdict(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      RecoveryStatus
+		wantBlocked bool
+		wantReason  string
+	}{
+		{
+			name: "needs mq submit blocks non force nuke",
+			status: RecoveryStatus{
+				Verdict:    polecat.WorkstateVerdictNeedsMQSubmit,
+				Reason:     "mq-not-submitted",
+				SafeToNuke: false,
+				Blockers:   []string{"mq_status=not_submitted"},
+			},
+			wantBlocked: true,
+			wantReason:  "mq_status=not_submitted",
+		},
+		{
+			name: "closed terminal source is safe",
+			status: RecoveryStatus{
+				Verdict:    polecat.WorkstateVerdictSafeToNuke,
+				Reason:     "reusable",
+				SafeToNuke: true,
+				MQStatus:   "not_required",
+			},
+		},
+		{
+			name: "canonical reason blocks when blockers are empty",
+			status: RecoveryStatus{
+				Verdict:    polecat.WorkstateVerdictNeedsRecovery,
+				Reason:     "git-check-failed",
+				SafeToNuke: false,
+			},
+			wantBlocked: true,
+			wantReason:  "git-check-failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := &SafetyCheckResult{Polecat: "gastown/fury"}
+			applyRecoveryStatusToSafetyResult(result, &tt.status)
+			if result.Blocked != tt.wantBlocked {
+				t.Fatalf("Blocked = %v, want %v (reasons=%v)", result.Blocked, tt.wantBlocked, result.Reasons)
+			}
+			if tt.wantReason != "" && (len(result.Reasons) == 0 || result.Reasons[0] != tt.wantReason) {
+				t.Fatalf("Reasons = %v, want first reason %q", result.Reasons, tt.wantReason)
+			}
+			if tt.wantReason == "" && len(result.Reasons) != 0 {
+				t.Fatalf("Reasons = %v, want none", result.Reasons)
+			}
+		})
 	}
 }
 

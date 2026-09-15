@@ -172,7 +172,7 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			d.ReuseStatus = "idle-recovery-needed"
 			d.Blockers = append(d.Blockers, "mq_status=unknown")
 			return d
-		} else if !in.HasSubmittableWork || in.MQNotRequired {
+		} else if !in.HasSubmittableWork || in.MQNotRequired || in.AssignedBeadTerminal {
 			d.MQStatus = "not_required"
 		} else if in.MRSubmitted {
 			d.MQStatus = "submitted"
