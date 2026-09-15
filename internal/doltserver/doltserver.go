@@ -1119,24 +1119,52 @@ func getDoltConfigPathFromProcess(pid int) string {
 	return resolveProcessPath(pid, getDoltFlagFromArgs(getProcessArgs(pid), "--config"))
 }
 
+func canonicalPath(path string) string {
+	if path == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		abs = filepath.Clean(path)
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return resolved
+	}
+	parent := filepath.Dir(abs)
+	if parent == abs {
+		return abs
+	}
+	resolvedParent := canonicalPath(parent)
+	if resolvedParent == "" {
+		return abs
+	}
+	return filepath.Join(resolvedParent, filepath.Base(abs))
+}
+
+func canonicalPathsEqual(a, b string) bool {
+	aInfo, aErr := os.Stat(a)
+	bInfo, bErr := os.Stat(b)
+	if aErr == nil && bErr == nil {
+		return os.SameFile(aInfo, bInfo)
+	}
+	return canonicalPath(a) == canonicalPath(b)
+}
+
 func doltProcessMatchesTownPaths(expectedDataDir, actualDataDir, actualConfigPath, actualCWD, stateDataDir string) bool {
-	expectedDir, _ := filepath.Abs(expectedDataDir)
+	expectedDir := canonicalPath(expectedDataDir)
 	if actualDataDir != "" {
-		actualDir, _ := filepath.Abs(actualDataDir)
-		return actualDir == expectedDir
+		return canonicalPathsEqual(actualDataDir, expectedDir)
 	}
 	if actualConfigPath != "" {
-		expectedConfig, _ := filepath.Abs(filepath.Join(expectedDir, "config.yaml"))
-		actualConfig, _ := filepath.Abs(actualConfigPath)
-		return actualConfig == expectedConfig
+		return canonicalPathsEqual(actualConfigPath, filepath.Join(expectedDir, "config.yaml"))
 	}
 	if actualCWD != "" {
-		absCWD, _ := filepath.Abs(actualCWD)
-		return absCWD == expectedDir || absCWD == filepath.Dir(expectedDir)
+		actualDir := canonicalPath(actualCWD)
+		return actualDir == expectedDir || actualDir == filepath.Dir(expectedDir)
 	}
 	if stateDataDir != "" {
-		actualDir, _ := filepath.Abs(stateDataDir)
-		return actualDir == expectedDir
+		return canonicalPathsEqual(stateDataDir, expectedDir)
 	}
 	return false
 }

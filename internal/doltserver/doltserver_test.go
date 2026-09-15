@@ -243,6 +243,193 @@ func TestDoltProcessMatchesTownPaths(t *testing.T) {
 	}
 }
 
+func TestDoltProcessMatchesTownPathsCanonicalizesAliases(t *testing.T) {
+	root := t.TempDir()
+	realTown := filepath.Join(root, "real-town")
+	aliasTown := filepath.Join(root, "alias-town")
+	if err := os.MkdirAll(filepath.Join(realTown, ".dolt-data"), 0755); err != nil {
+		t.Fatalf("mkdir real town: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(realTown, ".dolt-data", "config.yaml"), []byte("listener:\n  port: 3307\n"), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.Symlink(realTown, aliasTown); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	expectedDir := filepath.Join(realTown, ".dolt-data")
+	aliasDataDir := filepath.Join(aliasTown, ".dolt-data")
+	aliasConfigPath := filepath.Join(aliasDataDir, "config.yaml")
+
+	tests := []struct {
+		name             string
+		actualDataDir    string
+		actualConfigPath string
+		actualCWD        string
+		stateDataDir     string
+		want             bool
+	}{
+		{
+			name:          "matches aliased live data dir",
+			actualDataDir: aliasDataDir,
+			want:          true,
+		},
+		{
+			name:             "matches aliased config path",
+			actualConfigPath: aliasConfigPath,
+			want:             true,
+		},
+		{
+			name:      "matches aliased cwd in data dir",
+			actualCWD: aliasDataDir,
+			want:      true,
+		},
+		{
+			name:      "matches aliased cwd in town root",
+			actualCWD: aliasTown,
+			want:      true,
+		},
+		{
+			name:         "matches aliased daemon state",
+			stateDataDir: aliasDataDir,
+			want:         true,
+		},
+		{
+			name:             "live foreign config still beats matching aliased state",
+			actualConfigPath: filepath.Join(root, "foreign-town", ".dolt-data", "config.yaml"),
+			stateDataDir:     aliasDataDir,
+			want:             false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := doltProcessMatchesTownPaths(expectedDir, tt.actualDataDir, tt.actualConfigPath, tt.actualCWD, tt.stateDataDir)
+			if got != tt.want {
+				t.Fatalf("doltProcessMatchesTownPaths(...) = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDoltProcessMatchesTownPathsRejectsDifferentCanonicalTown(t *testing.T) {
+	root := t.TempDir()
+	expectedTown := filepath.Join(root, "expected")
+	foreignTown := filepath.Join(root, "foreign")
+	if err := os.MkdirAll(filepath.Join(expectedTown, ".dolt-data"), 0755); err != nil {
+		t.Fatalf("mkdir expected town: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(foreignTown, ".dolt-data"), 0755); err != nil {
+		t.Fatalf("mkdir foreign town: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignTown, ".dolt-data", "config.yaml"), []byte("listener:\n  port: 3307\n"), 0644); err != nil {
+		t.Fatalf("write foreign config: %v", err)
+	}
+
+	expectedDir := filepath.Join(expectedTown, ".dolt-data")
+	foreignDataDir := filepath.Join(foreignTown, ".dolt-data")
+
+	tests := []struct {
+		name             string
+		actualDataDir    string
+		actualConfigPath string
+		actualCWD        string
+		stateDataDir     string
+	}{
+		{
+			name:          "rejects foreign data dir",
+			actualDataDir: foreignDataDir,
+		},
+		{
+			name:             "rejects foreign config path",
+			actualConfigPath: filepath.Join(foreignDataDir, "config.yaml"),
+		},
+		{
+			name:      "rejects foreign cwd",
+			actualCWD: foreignDataDir,
+		},
+		{
+			name:         "rejects foreign state",
+			stateDataDir: foreignDataDir,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if doltProcessMatchesTownPaths(expectedDir, tt.actualDataDir, tt.actualConfigPath, tt.actualCWD, tt.stateDataDir) {
+				t.Fatal("doltProcessMatchesTownPaths(...) = true, want false")
+			}
+		})
+	}
+}
+
+func TestIsRunningReturnsLivePIDForAliasedStateDataDir(t *testing.T) {
+	root := t.TempDir()
+	realTown := filepath.Join(root, "real-town")
+	aliasTown := filepath.Join(root, "alias-town")
+	dataDir := filepath.Join(realTown, ".dolt-data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	if err := os.Symlink(realTown, aliasTown); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	if err := os.WriteFile(filepath.Join(dataDir, "config.yaml"), []byte(fmt.Sprintf("listener:\n  port: %d\n", port)), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	proc := exec.Command("sleep", "30")
+	proc.Dir = filepath.Join(aliasTown, ".dolt-data")
+	if err := proc.Start(); err != nil {
+		t.Fatalf("start process: %v", err)
+	}
+	defer func() {
+		_ = proc.Process.Kill()
+		_, _ = proc.Process.Wait()
+	}()
+
+	daemonDir := filepath.Join(realTown, "daemon")
+	if err := os.MkdirAll(daemonDir, 0755); err != nil {
+		t.Fatalf("mkdir daemon dir: %v", err)
+	}
+	pid := proc.Process.Pid
+	if err := os.WriteFile(filepath.Join(daemonDir, "dolt.pid"), []byte(strconv.Itoa(pid)+"\n"), 0644); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+	state := State{
+		Running: true,
+		PID:     pid,
+		Port:    port,
+		DataDir: filepath.Join(aliasTown, ".dolt-data"),
+	}
+	stateData, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("marshal state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(daemonDir, "dolt-state.json"), stateData, 0644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	running, gotPID, err := IsRunning(realTown)
+	if err != nil {
+		t.Fatalf("IsRunning failed: %v", err)
+	}
+	if !running {
+		t.Fatal("IsRunning returned running=false, want true")
+	}
+	if gotPID != pid {
+		t.Fatalf("IsRunning pid = %d, want %d", gotPID, pid)
+	}
+}
+
 func TestContainsPathBoundary(t *testing.T) {
 	tests := []struct {
 		name string
