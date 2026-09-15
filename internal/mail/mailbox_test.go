@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gofrs/flock"
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 )
@@ -208,6 +209,36 @@ func TestMailboxLegacyDelete(t *testing.T) {
 	err = m.Delete("msg-nonexistent")
 	if err != ErrMessageNotFound {
 		t.Errorf("Delete non-existent = %v, want ErrMessageNotFound", err)
+	}
+}
+
+func TestMailboxLegacyDeleteContextHonorsLockCancellation(t *testing.T) {
+	tmpDir := t.TempDir()
+	m := NewMailbox(tmpDir)
+	if err := m.Append(&Message{ID: "msg-001", Subject: "First"}); err != nil {
+		t.Fatalf("Append error: %v", err)
+	}
+
+	lock := flock.New(m.Path() + ".lock")
+	if err := lock.Lock(); err != nil {
+		t.Fatalf("Lock error: %v", err)
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- m.DeleteContext(ctx, "msg-001")
+	}()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("DeleteContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DeleteContext did not return after context cancellation")
 	}
 }
 

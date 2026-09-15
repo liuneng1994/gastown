@@ -108,6 +108,24 @@ func (m *Mailbox) lockLegacy() (*flock.Flock, error) {
 	return fl, nil
 }
 
+func (m *Mailbox) lockLegacyContext(ctx context.Context) (*flock.Flock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	fl := flock.New(m.path + ".lock")
+	locked, err := fl.TryLockContext(ctx, 10*time.Millisecond)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring mailbox lock: %w", err)
+	}
+	if !locked {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("acquiring mailbox lock: %w", err)
+		}
+		return nil, fmt.Errorf("acquiring mailbox lock: lock not acquired")
+	}
+	return fl, nil
+}
+
 // List returns all open messages in the mailbox.
 func (m *Mailbox) List() ([]*Message, error) {
 	ctx, cancel := bdReadCtx()
@@ -661,26 +679,41 @@ func (m *Mailbox) MarkRead(id string) error {
 }
 
 func (m *Mailbox) markReadBeads(id string) error {
-	if err := m.acknowledgeDeliveryForPrimary(id); err != nil {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.markReadBeadsContext(ctx, id)
+}
+
+func (m *Mailbox) markReadBeadsContext(ctx context.Context, id string) error {
+	if err := m.acknowledgeDeliveryForPrimaryContext(ctx, id); err != nil {
 		return err
 	}
 
 	// Resolve correct beadsDir based on bead ID prefix (GH#2423)
 	primary := beads.ResolveBeadsDirForID(m.beadsDir, id)
-	err := m.closeInDir(id, primary)
+	err := m.closeInDirContext(ctx, id, primary)
 	if errors.Is(err, ErrMessageNotFound) && primary != m.beadsDir {
 		// Cross-rig bead IDs (e.g. ne-*) may live in the home DB when created
 		// via the mail router (which always uses town beads). Fall back to
 		// m.beadsDir before giving up. See ne-bgr.
-		return m.closeInDir(id, m.beadsDir)
+		return m.closeInDirContext(ctx, id, m.beadsDir)
 	}
 	return err
 }
 
 // closeInDir closes a message in a specific beads directory.
 func (m *Mailbox) closeInDir(id, beadsDir string) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.closeInDirContext(ctx, id, beadsDir)
+}
+
+func (m *Mailbox) closeInDirContext(ctx context.Context, id, beadsDir string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if m.store != nil {
-		return m.storeCloseInDir(id)
+		return m.storeCloseInDirContext(ctx, id)
 	}
 
 	args := []string{"close", id}
@@ -689,14 +722,15 @@ func (m *Mailbox) closeInDir(id, beadsDir string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	ctx, cancel := bdWriteCtx()
-	defer cancel()
 	_, err := runBdCommand(ctx, args, m.workDir, beadsDir)
 	telemetry.RecordMailMessage(context.Background(), "read", telemetry.MailMessageInfo{
 		ID: id,
 		To: m.identity,
 	}, err)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if isBdNotFound(err) {
 			return ErrMessageNotFound
 		}
@@ -839,21 +873,31 @@ func (m *Mailbox) addReadLabelContext(ctx context.Context, id string) error {
 }
 
 func (m *Mailbox) acknowledgeDeliveryForPrimary(id string) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.acknowledgeDeliveryForPrimaryContext(ctx, id)
+}
+
+func (m *Mailbox) acknowledgeDeliveryForPrimaryContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if m.legacy {
 		return nil
 	}
 	if m.store != nil {
-		return m.storeAcknowledgeDeliveryForPrimary(id)
+		return m.storeAcknowledgeDeliveryForPrimaryContext(ctx, id)
 	}
 
-	msg, err := m.Get(id)
+	msg, err := m.GetContext(ctx, id)
 	if err != nil {
 		return err
 	}
 	if msg == nil || msg.DeliveryState == "" || AddressToIdentity(msg.To) != m.identity {
 		return nil
 	}
-	return AcknowledgeDeliveryBead(m.workDir, m.beadsDir, id, m.identity)
+	existingLabels := deliveryLabelsFromMessage(msg)
+	return acknowledgeDeliveryWithLabelsContext(ctx, m.workDir, routedBeadsDirForID(m.beadsDir, id), id, m.identity, existingLabels)
 }
 
 func (m *Mailbox) acknowledgeDeliveryForPrimaryMessage(msg *Message) error {
@@ -1032,20 +1076,40 @@ func (m *Mailbox) markUnreadLegacy(id string) error {
 
 // Delete removes a message.
 func (m *Mailbox) Delete(id string) error {
-	if m.legacy {
-		return m.deleteLegacy(id)
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.DeleteContext(ctx, id)
+}
+
+// DeleteContext removes a message using ctx for delivery ack, backing close,
+// and legacy mailbox lock acquisition.
+func (m *Mailbox) DeleteContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return m.MarkRead(id) // beads: just acknowledge/close
+	if m.legacy {
+		return m.deleteLegacyContext(ctx, id)
+	}
+	return m.markReadBeadsContext(ctx, id) // beads: just acknowledge/close
 }
 
 func (m *Mailbox) deleteLegacy(id string) error {
-	fl, err := m.lockLegacy()
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return m.deleteLegacyContext(ctx, id)
+}
+
+func (m *Mailbox) deleteLegacyContext(ctx context.Context, id string) error {
+	fl, err := m.lockLegacyContext(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = fl.Unlock() }()
 
-	messages, err := m.List()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	messages, err := m.ListContext(ctx)
 	if err != nil {
 		return err
 	}
@@ -1064,6 +1128,9 @@ func (m *Mailbox) deleteLegacy(id string) error {
 		return ErrMessageNotFound
 	}
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return m.rewriteLegacy(filtered)
 }
 

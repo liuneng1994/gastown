@@ -138,7 +138,13 @@ func (m *Mailbox) storeGetFromDirContext(ctx context.Context, id string) (*Messa
 func (m *Mailbox) storeCloseInDir(id string) error {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeCloseInDirContext(ctx, id)
+}
 
+func (m *Mailbox) storeCloseInDirContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	sessionID := runtime.SessionIDFromEnv()
 	err := m.store.CloseIssue(ctx, id, "", "", sessionID)
 	telemetry.RecordMailMessage(context.Background(), "read", telemetry.MailMessageInfo{
@@ -146,6 +152,9 @@ func (m *Mailbox) storeCloseInDir(id string) error {
 		To: m.identity,
 	}, err)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if strings.Contains(err.Error(), "not found") {
 			return ErrMessageNotFound
 		}
@@ -181,9 +190,18 @@ func (m *Mailbox) storeMarkReadOnlyContext(ctx context.Context, id string) error
 func (m *Mailbox) storeAcknowledgeDeliveryForPrimary(id string) error {
 	ctx, cancel := mailStoreCtx()
 	defer cancel()
+	return m.storeAcknowledgeDeliveryForPrimaryContext(ctx, id)
+}
 
+func (m *Mailbox) storeAcknowledgeDeliveryForPrimaryContext(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	si, err := m.store.GetIssue(ctx, id)
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if strings.Contains(err.Error(), "not found") {
 			return ErrMessageNotFound
 		}
@@ -199,7 +217,13 @@ func (m *Mailbox) storeAcknowledgeDeliveryForPrimary(id string) error {
 
 	toWrite := deliveryAckLabelsToWrite(m.identity, timeNow().UTC(), si.Labels)
 	for _, label := range toWrite {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := m.store.AddLabel(ctx, id, label, ""); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			if strings.Contains(err.Error(), "not found") {
 				return ErrMessageNotFound
 			}
@@ -211,7 +235,13 @@ func (m *Mailbox) storeAcknowledgeDeliveryForPrimary(id string) error {
 	if !deliveryPendingRemovalNeeded(labelsAfterAck) {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := m.store.RemoveLabel(ctx, id, DeliveryLabelPending, ""); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if strings.Contains(err.Error(), "not found") {
 			return ErrMessageNotFound
 		}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -29,6 +30,8 @@ var getMailboxForInbox = func(address string) (inboxContextLister, error) {
 var getMailboxForRead = func(address string) (mailReadMailbox, error) {
 	return getMailbox(address)
 }
+
+var mailArchiveSessionCreatedAt = session.SessionCreatedAtContext
 
 // getMailbox returns the mailbox for the given address.
 func getMailbox(address string) (*mail.Mailbox, error) {
@@ -144,6 +147,11 @@ type mailReadMailbox interface {
 	GetContext(ctx context.Context, id string) (*mail.Message, error)
 	ListContext(ctx context.Context) ([]*mail.Message, error)
 	MarkReadMessageContext(ctx context.Context, msg *mail.Message) error
+}
+
+type archiveMailbox interface {
+	ListContext(ctx context.Context) ([]*mail.Message, error)
+	DeleteContext(ctx context.Context, id string) error
 }
 
 func loadInboxSnapshot(mailbox inboxLister, unreadOnly bool) ([]*mail.Message, int, int, error) {
@@ -399,6 +407,9 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 }
 
 func runMailArchive(cmd *cobra.Command, args []string) error {
+	ctx, cancel := newMailCommandContext()
+	defer cancel()
+
 	// Determine which inbox
 	address := detectSender()
 
@@ -411,7 +422,7 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 		if len(args) > 0 {
 			return errors.New("--stale cannot be combined with message IDs")
 		}
-		return runMailArchiveStale(mailbox, address)
+		return runMailArchiveStale(ctx, mailbox, address)
 	}
 	if len(args) == 0 {
 		return errors.New("message ID required unless using --stale")
@@ -424,6 +435,10 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	return runMailArchiveWithMailbox(ctx, mailbox, args, os.Stdout)
+}
+
+func runMailArchiveWithMailbox(ctx context.Context, mailbox archiveMailbox, args []string, out io.Writer) error {
 	// Archive all specified messages.
 	//
 	// Archive is a mail cleanup operation, not a bead operation. If the
@@ -434,14 +449,22 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 	archived := 0
 	gcd := 0
 	var errMsgs []string
+archiveLoop:
 	for _, msgID := range args {
-		err := mailbox.Delete(msgID)
+		if err := ctx.Err(); err != nil {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, mailCommandPhaseError(ctx, "archiving message", err)))
+			break
+		}
+		err := mailbox.DeleteContext(ctx, msgID)
 		switch {
 		case err == nil:
 			archived++
+		case mailCommandContextExpired(ctx, err):
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, mailCommandPhaseError(ctx, "archiving message", err)))
+			break archiveLoop
 		case errors.Is(err, mail.ErrMessageNotFound):
 			gcd++
-			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
+			fmt.Fprintf(out, "  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), msgID)
 		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", msgID, err))
@@ -450,19 +473,19 @@ func runMailArchive(cmd *cobra.Command, args []string) error {
 
 	// Report results
 	if len(errMsgs) > 0 {
-		fmt.Printf("%s Archived %d/%d messages\n",
+		fmt.Fprintf(out, "%s Archived %d/%d messages\n",
 			style.Bold.Render("⚠"), archived+gcd, len(args))
 		for _, e := range errMsgs {
-			fmt.Printf("  Error: %s\n", e)
+			fmt.Fprintf(out, "  Error: %s\n", e)
 		}
 		return fmt.Errorf("failed to archive %d messages", len(errMsgs))
 	}
 
 	total := archived + gcd
 	if total == 1 {
-		fmt.Printf("%s Message archived\n", style.Bold.Render("✓"))
+		fmt.Fprintf(out, "%s Message archived\n", style.Bold.Render("✓"))
 	} else {
-		fmt.Printf("%s Archived %d messages\n", style.Bold.Render("✓"), total)
+		fmt.Fprintf(out, "%s Archived %d messages\n", style.Bold.Render("✓"), total)
 	}
 	return nil
 }
@@ -472,7 +495,7 @@ type staleMessage struct {
 	Reason  string
 }
 
-func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
+func runMailArchiveStale(ctx context.Context, mailbox archiveMailbox, address string) error {
 	identity, err := session.ParseAddress(address)
 	if err != nil {
 		return fmt.Errorf("determining session for %s: %w", address, err)
@@ -483,31 +506,35 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 		return fmt.Errorf("could not determine session name for %s", address)
 	}
 
-	sessionStart, err := session.SessionCreatedAt(sessionName)
+	sessionStart, err := mailArchiveSessionCreatedAt(ctx, sessionName)
 	if err != nil {
-		return fmt.Errorf("getting session start time for %s: %w", sessionName, err)
+		return mailCommandPhaseError(ctx, fmt.Sprintf("getting session start time for %s", sessionName), err)
 	}
 
-	messages, err := mailbox.List()
+	return runMailArchiveStaleWithMailbox(ctx, mailbox, sessionStart, os.Stdout)
+}
+
+func runMailArchiveStaleWithMailbox(ctx context.Context, mailbox archiveMailbox, sessionStart time.Time, out io.Writer) error {
+	messages, err := mailbox.ListContext(ctx)
 	if err != nil {
-		return fmt.Errorf("listing messages: %w", err)
+		return mailCommandPhaseError(ctx, "listing stale messages", err)
 	}
 
 	staleMessages := staleMessagesForSession(messages, sessionStart)
 	if mailArchiveDryRun {
 		if len(staleMessages) == 0 {
-			fmt.Printf("%s No stale messages found\n", style.Success.Render("✓"))
+			fmt.Fprintf(out, "%s No stale messages found\n", style.Success.Render("✓"))
 			return nil
 		}
-		fmt.Printf("%s Would archive %d stale message(s):\n", style.Dim.Render("(dry-run)"), len(staleMessages))
+		fmt.Fprintf(out, "%s Would archive %d stale message(s):\n", style.Dim.Render("(dry-run)"), len(staleMessages))
 		for _, stale := range staleMessages {
-			fmt.Printf("  %s %s\n", style.Dim.Render(stale.Message.ID), stale.Message.Subject)
+			fmt.Fprintf(out, "  %s %s\n", style.Dim.Render(stale.Message.ID), stale.Message.Subject)
 		}
 		return nil
 	}
 
 	if len(staleMessages) == 0 {
-		fmt.Printf("%s No stale messages to archive\n", style.Success.Render("✓"))
+		fmt.Fprintf(out, "%s No stale messages to archive\n", style.Success.Render("✓"))
 		return nil
 	}
 
@@ -518,14 +545,22 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 	archived := 0
 	gcd := 0
 	var errMsgs []string
+staleArchiveLoop:
 	for _, stale := range staleMessages {
-		err := mailbox.Delete(stale.Message.ID)
+		if err := ctx.Err(); err != nil {
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", stale.Message.ID, mailCommandPhaseError(ctx, "archiving stale message", err)))
+			break
+		}
+		err := mailbox.DeleteContext(ctx, stale.Message.ID)
 		switch {
 		case err == nil:
 			archived++
+		case mailCommandContextExpired(ctx, err):
+			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", stale.Message.ID, mailCommandPhaseError(ctx, "archiving stale message", err)))
+			break staleArchiveLoop
 		case errors.Is(err, mail.ErrMessageNotFound):
 			gcd++
-			fmt.Printf("  %s %s: underlying bead already gone (GC'd), entry cleared\n",
+			fmt.Fprintf(out, "  %s %s: underlying bead already gone (GC'd), entry cleared\n",
 				style.Dim.Render("note"), stale.Message.ID)
 		default:
 			errMsgs = append(errMsgs, fmt.Sprintf("%s: %v", stale.Message.ID, err))
@@ -533,20 +568,25 @@ func runMailArchiveStale(mailbox *mail.Mailbox, address string) error {
 	}
 
 	if len(errMsgs) > 0 {
-		fmt.Printf("%s Archived %d/%d stale messages\n", style.Bold.Render("⚠"), archived+gcd, len(staleMessages))
+		fmt.Fprintf(out, "%s Archived %d/%d stale messages\n", style.Bold.Render("⚠"), archived+gcd, len(staleMessages))
 		for _, e := range errMsgs {
-			fmt.Printf("  Error: %s\n", e)
+			fmt.Fprintf(out, "  Error: %s\n", e)
 		}
 		return fmt.Errorf("failed to archive %d stale messages", len(errMsgs))
 	}
 
 	total := archived + gcd
 	if total == 1 {
-		fmt.Printf("%s Stale message archived\n", style.Bold.Render("✓"))
+		fmt.Fprintf(out, "%s Stale message archived\n", style.Bold.Render("✓"))
 	} else {
-		fmt.Printf("%s Archived %d stale messages\n", style.Bold.Render("✓"), total)
+		fmt.Fprintf(out, "%s Archived %d stale messages\n", style.Bold.Render("✓"), total)
 	}
 	return nil
+}
+
+func mailCommandContextExpired(ctx context.Context, err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), context.Canceled)
 }
 
 func staleMessagesForSession(messages []*mail.Message, sessionStart time.Time) []staleMessage {

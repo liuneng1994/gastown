@@ -1,6 +1,7 @@
 package session
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -10,8 +11,14 @@ import (
 
 // SessionCreatedAt returns the time a tmux session was created.
 func SessionCreatedAt(sessionName string) (time.Time, error) {
+	return SessionCreatedAtContext(context.Background(), sessionName)
+}
+
+// SessionCreatedAtContext returns the time a tmux session was created while
+// honoring ctx for the tmux lookup.
+func SessionCreatedAtContext(ctx context.Context, sessionName string) (time.Time, error) {
 	t := tmux.NewTmux()
-	info, err := t.GetSessionInfo(sessionName)
+	info, err := t.GetSessionInfoContext(ctx, sessionName)
 	if err != nil {
 		return time.Time{}, err
 	}

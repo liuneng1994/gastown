@@ -1,6 +1,8 @@
 package session
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,16 @@ func TestParseTmuxSessionCreated(t *testing.T) {
 	}
 	if !parsed.Equal(expected) {
 		t.Fatalf("parsed time mismatch: got %v want %v", parsed, expected)
+	}
+}
+
+func TestSessionCreatedAtContextCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := SessionCreatedAtContext(ctx, "gt-test-session")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("SessionCreatedAtContext error = %v, want context.Canceled", err)
 	}
 }
 

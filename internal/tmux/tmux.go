@@ -3538,8 +3538,14 @@ func (t *Tmux) IsIdle(session string) bool {
 
 // GetSessionInfo returns detailed information about a session.
 func (t *Tmux) GetSessionInfo(name string) (*SessionInfo, error) {
+	return t.GetSessionInfoContext(context.Background(), name)
+}
+
+// GetSessionInfoContext returns detailed information about a session while
+// honoring ctx for the tmux subprocess.
+func (t *Tmux) GetSessionInfoContext(ctx context.Context, name string) (*SessionInfo, error) {
 	format := "#{session_name}|#{session_windows}|#{session_created}|#{session_attached}|#{session_activity}|#{session_last_attached}"
-	out, err := t.run("list-sessions", "-F", format, "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
+	out, err := t.runContext(ctx, "list-sessions", "-F", format, "-f", fmt.Sprintf("#{==:#{session_name},%s}", name))
 	if err != nil {
 		return nil, err
 	}
