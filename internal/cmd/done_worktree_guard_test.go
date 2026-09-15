@@ -296,6 +296,28 @@ func TestIsDoneCommand(t *testing.T) {
 	if isDoneCommand(root) {
 		t.Fatal("root command should not be detected as done")
 	}
+
+	dog := &cobra.Command{Use: "dog"}
+	dogDone := &cobra.Command{Use: "done"}
+	dog.AddCommand(dogDone)
+	root.AddCommand(dog)
+	if isDoneCommand(dogDone) {
+		t.Fatal("dog done subcommand should not be detected as root-level gt done")
+	}
+}
+
+func TestPersistentPreRunDogDoneDoesNotUsePolecatDoneGuard(t *testing.T) {
+	t.Setenv("BD_ACTOR", "dog")
+
+	root := &cobra.Command{Use: "gt"}
+	dog := &cobra.Command{Use: "dog"}
+	dogDone := &cobra.Command{Use: "done"}
+	dog.AddCommand(dogDone)
+	root.AddCommand(dog)
+
+	if err := persistentPreRun(dogDone, nil); err != nil {
+		t.Fatalf("persistentPreRun(dog done) error = %v, want nil", err)
+	}
 }
 
 func TestPersistentPreRunDoneRejectsBeforeRegistryFallback(t *testing.T) {
