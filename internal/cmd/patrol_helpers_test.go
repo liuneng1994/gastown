@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -170,6 +172,174 @@ esac
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return logPath
+}
+
+func TestFindActivePatrolUsesReadOnlyBDForDiscovery(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mock bd script uses POSIX shell")
+	}
+	townRoot := setupRefinerySafetyStopTown(t)
+	logPath := installPatrolDiscoveryReadOnlyMockBD(t)
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	cfg := PatrolConfig{
+		PatrolMolName: constants.MolWitnessPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "testrig/witness",
+	}
+
+	start := time.Now()
+	patrolID, _, found, err := findActivePatrol(cfg)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("findActivePatrol error = %v", err)
+	}
+	if !found {
+		t.Fatal("findActivePatrol found no active patrol")
+	}
+	if patrolID != "gt-wisp-active" {
+		t.Fatalf("patrolID = %q, want gt-wisp-active", patrolID)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("findActivePatrol took %s; expected read-only discovery to fail fast under migration lock contention", elapsed)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	log := string(logData)
+	for _, want := range []string{
+		"cmd=list readonly=true auto=off",
+		"cmd=query readonly=true auto=off",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("patrol discovery did not run %q under read-only mode:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "schema migration lock unavailable") {
+		t.Fatalf("read-only patrol discovery still hit simulated migration lock:\n%s", log)
+	}
+}
+
+func installPatrolDiscoveryReadOnlyMockBD(t *testing.T) string {
+	t.Helper()
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "bd.log")
+	script := `#!/bin/sh
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+printf 'cmd=%s readonly=%s auto=%s args=%s\n' "$cmd" "${BD_READONLY:-}" "${BD_DOLT_AUTO_COMMIT:-}" "$*" >> "` + logPath + `"
+case "$cmd" in
+  version)
+    echo "bd test"
+    ;;
+  list)
+    if [ "${BD_READONLY:-}" != "true" ]; then
+      echo "schema migration lock unavailable: timeout" >&2
+      exit 1
+    fi
+    printf '%s\n' '[{"id":"gt-wisp-active","title":"mol-witness-patrol (wisp)","status":"hooked","priority":2,"issue_type":"task","assignee":"testrig/witness","created_at":"2026-09-15T00:00:00Z","updated_at":"2026-09-15T00:00:00Z"}]'
+    ;;
+  query)
+    if [ "${BD_READONLY:-}" != "true" ]; then
+      echo "schema migration lock unavailable: timeout" >&2
+      exit 1
+    fi
+    case "$*" in
+      *parent=\\\"gt-wisp-active\\\"*)
+        printf '%s\n' '[{"id":"gt-wisp-child","title":"inbox-check","status":"open","priority":2,"issue_type":"task","parent":"gt-wisp-active","created_at":"2026-09-15T00:00:01Z","updated_at":"2026-09-15T00:00:01Z"}]'
+        ;;
+      *)
+        printf '%s\n' '[]'
+        ;;
+    esac
+    ;;
+  *)
+    printf '%s\n' '[]'
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return logPath
+}
+
+func TestFindActivePatrolDoesNotWaitForMigrationLock(t *testing.T) {
+	requireBd(t)
+	tmpDir, b := setupPatrolTestDB(t)
+
+	molName := "mol-test-patrol"
+	assignee := "testrig/witness"
+	rootID := createHookedPatrol(t, b, molName, assignee, true /* withOpenChild */)
+
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	dbName := beads.DatabaseNameFromMetadata(beadsDir)
+	if dbName == "" {
+		t.Fatal("test beads database metadata did not contain dolt_database")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	dsn := fmt.Sprintf("root:@tcp(127.0.0.1:%s)/%s", testutil.DoltContainerPort(), dbName)
+	lockHolder, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open lock holder: %v", err)
+	}
+	defer lockHolder.Close()
+
+	lockConn, err := lockHolder.Conn(ctx)
+	if err != nil {
+		t.Fatalf("pin lock holder: %v", err)
+	}
+	defer lockConn.Close()
+
+	lockName := "bd_schema_init:" + dbName
+	var locked int
+	if err := lockConn.QueryRowContext(ctx, "SELECT GET_LOCK(?, 0)", lockName).Scan(&locked); err != nil {
+		t.Fatalf("hold migration lock: %v", err)
+	}
+	if locked != 1 {
+		t.Fatalf("GET_LOCK returned %d, want 1", locked)
+	}
+	defer func() {
+		var released int
+		if err := lockConn.QueryRowContext(context.Background(), "SELECT RELEASE_LOCK(?)", lockName).Scan(&released); err != nil {
+			t.Logf("release migration lock: %v", err)
+		}
+	}()
+
+	cfg := PatrolConfig{
+		PatrolMolName: molName,
+		BeadsDir:      tmpDir,
+		Assignee:      assignee,
+		Beads:         b,
+	}
+
+	start := time.Now()
+	patrolID, _, found, findErr := findActivePatrol(cfg)
+	elapsed := time.Since(start)
+	if findErr != nil {
+		t.Fatalf("findActivePatrol error = %v", findErr)
+	}
+	if !found {
+		t.Fatal("expected active patrol, got not found")
+	}
+	if patrolID != rootID {
+		t.Fatalf("patrolID = %q, want %q", patrolID, rootID)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("findActivePatrol took %s while migration lock was held; read-only discovery should avoid lock wait", elapsed)
+	}
 }
 
 func TestBuildRefineryPatrolVars_NilMergeQueue(t *testing.T) {

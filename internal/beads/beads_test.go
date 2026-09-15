@@ -667,6 +667,44 @@ func TestBuildMutationBDEnvForcesWritableCommit(t *testing.T) {
 	}
 }
 
+func TestBuildCommandEnvOnlyForcesModeForReadOnlyCommands(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"dolt_database":"hq","dolt_server_host":"127.0.0.1","dolt_server_port":3307}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BD_DOLT_AUTO_COMMIT", "off")
+	t.Setenv("BD_READONLY", "true")
+
+	b := New(t.TempDir())
+	readEnv := b.buildCommandEnv(beadsDir, []string{"list", "--json"})
+	readGot := envMap(readEnv)
+	if readGot["BEADS_DIR"] != beadsDir {
+		t.Fatalf("read BEADS_DIR = %q, want %q in %v", readGot["BEADS_DIR"], beadsDir, readEnv)
+	}
+	if readGot["BD_DOLT_AUTO_COMMIT"] != "off" {
+		t.Fatalf("read BD_DOLT_AUTO_COMMIT = %q, want off in %v", readGot["BD_DOLT_AUTO_COMMIT"], readEnv)
+	}
+	if readGot["BD_READONLY"] != "true" {
+		t.Fatalf("read BD_READONLY = %q, want true in %v", readGot["BD_READONLY"], readEnv)
+	}
+
+	writeEnv := b.buildCommandEnv(beadsDir, []string{"update", "gt-123", "--status=in_progress"})
+	writeGot := envMap(writeEnv)
+	if writeGot["BEADS_DIR"] != beadsDir {
+		t.Fatalf("write BEADS_DIR = %q, want %q in %v", writeGot["BEADS_DIR"], beadsDir, writeEnv)
+	}
+	if writeGot["BD_DOLT_AUTO_COMMIT"] != "off" {
+		t.Fatalf("write BD_DOLT_AUTO_COMMIT = %q, want inherited off in %v", writeGot["BD_DOLT_AUTO_COMMIT"], writeEnv)
+	}
+	if writeGot["BD_READONLY"] != "true" {
+		t.Fatalf("write BD_READONLY = %q, want inherited true in %v", writeGot["BD_READONLY"], writeEnv)
+	}
+}
+
 func TestDeleteBeadsUseSupportedBdDeleteFlags(t *testing.T) {
 	ResetBdAllowStaleCacheForTest()
 	t.Cleanup(ResetBdAllowStaleCacheForTest)
