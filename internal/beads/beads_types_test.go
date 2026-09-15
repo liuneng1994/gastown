@@ -1,11 +1,15 @@
 package beads
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/constants"
 )
@@ -135,6 +139,30 @@ func readMockBDLog(t *testing.T, logPath string) string {
 		t.Fatalf("read mock bd log: %v", err)
 	}
 	return string(data)
+}
+
+func waitForTestPath(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func waitForTestProcessExit(t *testing.T, pid int, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !beadsTestProcessAlive(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d still alive after %s", pid, timeout)
 }
 
 func TestFindTownRoot(t *testing.T) {
@@ -307,6 +335,112 @@ func TestEnsureCustomTypes(t *testing.T) {
 		err := EnsureCustomTypes("/nonexistent/path/.beads")
 		if err == nil {
 			t.Error("expected error for non-existent beads dir")
+		}
+	})
+
+	t.Run("canceled context stops before bd setup", func(t *testing.T) {
+		logPath := installMockBDRecorder(t)
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		ResetEnsuredDirs()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := EnsureCustomTypesContext(ctx, beadsDir)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("EnsureCustomTypesContext error = %v, want context.Canceled", err)
+		}
+		if logOutput := readMockBDLog(t, logPath); logOutput != "" {
+			t.Fatalf("mock bd log = %q, want no bd subprocesses", logOutput)
+		}
+	})
+
+	t.Run("context cancellation kills blocked setup subprocess", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("POSIX process liveness assertion")
+		}
+
+		tmpDir := t.TempDir()
+		binDir := t.TempDir()
+		logPath := filepath.Join(tmpDir, "bd.log")
+		startedPath := filepath.Join(tmpDir, "bd-started")
+		pidPath := filepath.Join(tmpDir, "bd.pid")
+		script := `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_LOG"
+cmd=""
+for arg in "$@"; do
+  case "$arg" in
+    --*) ;;
+    *) cmd="$arg"; break ;;
+  esac
+done
+case "$cmd" in
+  config)
+    if echo "$*" | grep -q "set types.custom"; then
+      printf '%s\n' "$$" > "$BD_PID_FILE"
+      : > "$BD_STARTED_FILE"
+      sleep 60
+      exit 0
+    fi
+    exit 0
+    ;;
+  migrate)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`
+		if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+			t.Fatalf("write mock bd: %v", err)
+		}
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		t.Setenv("BD_LOG", logPath)
+		t.Setenv("BD_STARTED_FILE", startedPath)
+		t.Setenv("BD_PID_FILE", pidPath)
+
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		sentinelPath := filepath.Join(beadsDir, typesSentinel)
+		if err := os.WriteFile(sentinelPath, []byte("stale\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		ResetEnsuredDirs()
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- EnsureCustomTypesContext(ctx, beadsDir)
+		}()
+
+		waitForTestPath(t, startedPath, time.Second)
+		cancel()
+
+		err := <-errCh
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("EnsureCustomTypesContext error = %v, want context.Canceled", err)
+		}
+
+		pidBytes, err := os.ReadFile(pidPath)
+		if err != nil {
+			t.Fatalf("read bd pid: %v", err)
+		}
+		pid := 0
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(pidBytes)), "%d", &pid); err != nil {
+			t.Fatalf("parse bd pid %q: %v", string(pidBytes), err)
+		}
+		waitForTestProcessExit(t, pid, time.Second)
+
+		logOutput := readMockBDLog(t, logPath)
+		if !strings.Contains(logOutput, "config set types.custom") {
+			t.Fatalf("mock bd log missing config set types.custom:\n%s", logOutput)
 		}
 	})
 

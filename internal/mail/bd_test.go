@@ -171,18 +171,18 @@ func TestBdError_ImplementsErrorInterface(t *testing.T) {
 	_ = err.Error() // Should compile and not panic
 }
 
-func TestParseBeadsListOutput(t *testing.T) {
-	created := time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)
-	valid, err := json.Marshal([]BeadsMessage{{
-		ID:        "msg-1",
-		Title:     "Hello",
-		Status:    "open",
-		Priority:  2,
-		CreatedAt: created,
-		Labels:    []string{"gt:message", "from:mayor/"},
+func TestParseMessageSQLRows(t *testing.T) {
+	valid, err := json.Marshal([]messageSQLRow{{
+		ID:          "msg-1",
+		Title:       "Hello",
+		Status:      "open",
+		Priority:    2,
+		CreatedAt:   "2026-06-12T12:00:00Z",
+		LabelsCSV:   "gt:message,from:mayor/",
+		AssigneeHit: 1,
 	}})
 	if err != nil {
-		t.Fatalf("marshal valid message: %v", err)
+		t.Fatalf("marshal valid row: %v", err)
 	}
 
 	tests := []struct {
@@ -192,7 +192,6 @@ func TestParseBeadsListOutput(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "empty", input: nil},
-		{name: "plain no issues", input: []byte("No issues found.\n")},
 		{name: "null", input: []byte("null\n")},
 		{name: "empty array", input: []byte("[]\n")},
 		{name: "valid array", input: valid, wantLen: 1},
@@ -202,31 +201,35 @@ func TestParseBeadsListOutput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseBeadsListOutput(tt.input)
+			got, err := parseMessageSQLRows(tt.input)
 			if (err != nil) != tt.wantErr {
-				t.Fatalf("parseBeadsListOutput() error = %v, wantErr %v", err, tt.wantErr)
+				t.Fatalf("parseMessageSQLRows() error = %v, wantErr %v", err, tt.wantErr)
 			}
 			if len(got) != tt.wantLen {
-				t.Fatalf("parseBeadsListOutput() returned %d messages, want %d", len(got), tt.wantLen)
+				t.Fatalf("parseMessageSQLRows() returned %d rows, want %d", len(got), tt.wantLen)
 			}
 		})
 	}
 
-	got, err := parseBeadsListOutput(valid)
+	got, err := parseMessageSQLRows(valid)
 	if err != nil {
 		t.Fatalf("parse valid output: %v", err)
 	}
 	if len(got) != 1 {
-		t.Fatalf("parse valid output returned %d messages, want 1", len(got))
+		t.Fatalf("parse valid output returned %d rows, want 1", len(got))
 	}
 	if got[0].ID != "msg-1" || got[0].Title != "Hello" || got[0].Status != "open" || got[0].Priority != 2 {
-		t.Fatalf("parse valid output returned unexpected message: %#v", got[0])
+		t.Fatalf("parse valid output returned unexpected row: %#v", got[0])
 	}
-	if !got[0].CreatedAt.Equal(created) {
-		t.Fatalf("CreatedAt = %v, want %v", got[0].CreatedAt, created)
+	if got[0].AssigneeHit != 1 {
+		t.Fatalf("AssigneeHit = %d, want 1", got[0].AssigneeHit)
 	}
-	if len(got[0].Labels) != 2 || got[0].Labels[0] != "gt:message" || got[0].Labels[1] != "from:mayor/" {
-		t.Fatalf("Labels = %#v, want gt:message/from:mayor/", got[0].Labels)
+	bm := got[0].toBeadsMessage(false)
+	if !bm.CreatedAt.Equal(time.Date(2026, 6, 12, 12, 0, 0, 0, time.UTC)) {
+		t.Fatalf("CreatedAt = %v, want 2026-06-12T12:00:00Z", bm.CreatedAt)
+	}
+	if len(bm.Labels) != 2 || bm.Labels[0] != "gt:message" || bm.Labels[1] != "from:mayor/" {
+		t.Fatalf("Labels = %#v, want gt:message/from:mayor/", bm.Labels)
 	}
 }
 

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,20 @@ import (
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 )
+
+var mailCommandTimeout = 4 * time.Second
+
+var newMailCommandContext = func() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), mailCommandTimeout)
+}
+
+var getMailboxForInbox = func(address string) (inboxContextLister, error) {
+	return getMailbox(address)
+}
+
+var getMailboxForRead = func(address string) (mailReadMailbox, error) {
+	return getMailbox(address)
+}
 
 // getMailbox returns the mailbox for the given address.
 func getMailbox(address string) (*mail.Mailbox, error) {
@@ -33,6 +48,9 @@ func getMailbox(address string) (*mail.Mailbox, error) {
 }
 
 func runMailInbox(cmd *cobra.Command, args []string) error {
+	ctx, cancel := newMailCommandContext()
+	defer cancel()
+
 	// Check for mutually exclusive flags
 	if mailInboxAll && mailInboxUnread {
 		return errors.New("--all and --unread are mutually exclusive")
@@ -48,16 +66,20 @@ func runMailInbox(cmd *cobra.Command, args []string) error {
 		address = detectSender()
 	}
 
-	mailbox, err := getMailbox(address)
+	mailbox, err := getMailboxForInbox(address)
 	if err != nil {
 		return err
 	}
 
+	return runMailInboxWithMailbox(ctx, mailbox, address)
+}
+
+func runMailInboxWithMailbox(ctx context.Context, mailbox inboxContextLister, address string) error {
 	// Load the inbox once. Count() and ListUnread() both call List(), so using
 	// them here doubles the bd/Dolt reads on the hot patrol path.
-	messages, total, unread, err := loadInboxSnapshot(mailbox, mailInboxUnread)
+	messages, total, unread, err := loadInboxSnapshotContext(ctx, mailbox, mailInboxUnread)
 	if err != nil {
-		return fmt.Errorf("listing messages: %w", err)
+		return mailCommandPhaseError(ctx, "listing messages", err)
 	}
 
 	// JSON output
@@ -114,11 +136,33 @@ type inboxLister interface {
 	List() ([]*mail.Message, error)
 }
 
+type inboxContextLister interface {
+	ListContext(ctx context.Context) ([]*mail.Message, error)
+}
+
+type mailReadMailbox interface {
+	GetContext(ctx context.Context, id string) (*mail.Message, error)
+	ListContext(ctx context.Context) ([]*mail.Message, error)
+	MarkReadMessageContext(ctx context.Context, msg *mail.Message) error
+}
+
 func loadInboxSnapshot(mailbox inboxLister, unreadOnly bool) ([]*mail.Message, int, int, error) {
 	allMessages, err := mailbox.List()
 	if err != nil {
 		return nil, 0, 0, err
 	}
+	return inboxSnapshotFromMessages(allMessages, unreadOnly)
+}
+
+func loadInboxSnapshotContext(ctx context.Context, mailbox inboxContextLister, unreadOnly bool) ([]*mail.Message, int, int, error) {
+	allMessages, err := mailbox.ListContext(ctx)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return inboxSnapshotFromMessages(allMessages, unreadOnly)
+}
+
+func inboxSnapshotFromMessages(allMessages []*mail.Message, unreadOnly bool) ([]*mail.Message, int, int, error) {
 	if allMessages == nil {
 		allMessages = make([]*mail.Message, 0)
 	}
@@ -151,26 +195,33 @@ func filterUnreadMessages(messages []*mail.Message) []*mail.Message {
 }
 
 func runMailRead(cmd *cobra.Command, args []string) error {
+	ctx, cancel := newMailCommandContext()
+	defer cancel()
+
+	// Determine which inbox
+	address := detectSender()
+
+	mailbox, err := getMailboxForRead(address)
+	if err != nil {
+		return err
+	}
+
+	return runMailReadWithMailbox(ctx, mailbox, address, args)
+}
+
+func runMailReadWithMailbox(ctx context.Context, mailbox mailReadMailbox, address string, args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("message ID or index required\n\nRun 'gt mail inbox' to list messages and their IDs")
 	}
 	msgRef := args[0]
 
-	// Determine which inbox
-	address := detectSender()
-
-	mailbox, err := getMailbox(address)
-	if err != nil {
-		return err
-	}
-
 	// Check if the argument is a numeric index (1-based)
 	var msgID string
 	if idx, err := strconv.Atoi(msgRef); err == nil && idx > 0 {
 		// Numeric index: resolve to message ID by listing inbox
-		messages, err := mailbox.List()
+		messages, err := mailbox.ListContext(ctx)
 		if err != nil {
-			return fmt.Errorf("listing messages: %w", err)
+			return mailCommandPhaseError(ctx, "listing messages", err)
 		}
 		if idx > len(messages) {
 			return fmt.Errorf("index %d out of range (inbox has %d messages)", idx, len(messages))
@@ -180,17 +231,9 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 		msgID = msgRef
 	}
 
-	msg, err := mailbox.Get(msgID)
+	msg, err := mailbox.GetContext(ctx, msgID)
 	if err != nil {
-		return fmt.Errorf("getting message: %w", err)
-	}
-
-	// Mark as read when viewed (adds "read" label, does not close/archive).
-	// Handoff messages are preserved via the hook mechanism, so marking
-	// read here is safe — hooked mail is found via gt hook, not the inbox.
-	if err := mailbox.MarkReadOnly(msgID); err != nil {
-		// Non-fatal: message was retrieved, just couldn't mark
-		style.PrintWarning("could not mark message as read: %v", err)
+		return mailCommandPhaseError(ctx, "getting message", err)
 	}
 
 	// JSON output
@@ -200,10 +243,7 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 		if err := enc.Encode(msg); err != nil {
 			return err
 		}
-		// Ack after output so JSON reflects accurate read-time state.
-		if ackErr := mailbox.AcknowledgeDeliveries(address, []*mail.Message{msg}); ackErr != nil {
-			fmt.Fprintf(os.Stderr, "gt mail read: delivery ack failed: %v\n", ackErr)
-		}
+		warnMailReadBookkeeping(markMailReadViewed(ctx, mailbox, msg))
 		return nil
 	}
 
@@ -237,12 +277,36 @@ func runMailRead(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%s\n", msg.Body)
 	}
 
-	// Ack after output (non-fatal).
-	if ackErr := mailbox.AcknowledgeDeliveries(address, []*mail.Message{msg}); ackErr != nil {
-		fmt.Fprintf(os.Stderr, "gt mail read: delivery ack failed: %v\n", ackErr)
-	}
-
+	warnMailReadBookkeeping(markMailReadViewed(ctx, mailbox, msg))
 	return nil
+}
+
+func markMailReadViewed(ctx context.Context, mailbox mailReadMailbox, msg *mail.Message) error {
+	// Mark as read when viewed (adds "read" label, does not close/archive).
+	// Handoff messages are preserved via the hook mechanism, so marking
+	// read here is safe — hooked mail is found via gt hook, not the inbox.
+	return mailbox.MarkReadMessageContext(ctx, msg)
+}
+
+func warnMailReadBookkeeping(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		style.PrintWarning("could not mark message as read before command deadline %s: %v", mailCommandTimeout, err)
+		return
+	}
+	style.PrintWarning("could not mark message as read: %v", err)
+}
+
+func mailCommandPhaseError(ctx context.Context, phase string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s timed out after %s: %w", phase, mailCommandTimeout, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return fmt.Errorf("%s canceled: %w", phase, err)
+	}
+	return fmt.Errorf("%s: %w", phase, err)
 }
 
 func runMailPeek(cmd *cobra.Command, args []string) error {

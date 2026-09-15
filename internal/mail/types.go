@@ -133,6 +133,8 @@ type Message struct {
 	// DeliveryAckedAt is when receipt was acknowledged.
 	DeliveryAckedAt *time.Time `json:"delivery_acked_at,omitempty"`
 
+	deliveryLabels []string
+
 	// SuppressNotify tells the router to skip all recipient notification
 	// (no nudge, no banner). Set by the CLI when --no-notify is passed.
 	// In-memory only — not serialized.
@@ -426,6 +428,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		Type:            msgType,
 		ThreadID:        bm.threadID,
 		ReplyTo:         bm.replyTo,
+		Pinned:          bm.Pinned,
 		Wisp:            bm.Wisp,
 		CC:              ccAddrs,
 		Queue:           bm.queue,
@@ -435,6 +438,7 @@ func (bm *BeadsMessage) ToMessage() *Message {
 		DeliveryState:   bm.deliveryState,
 		DeliveryAckedBy: bm.deliveryAckedBy,
 		DeliveryAckedAt: bm.deliveryAckedAt,
+		deliveryLabels:  append([]string(nil), bm.Labels...),
 	}
 }
 

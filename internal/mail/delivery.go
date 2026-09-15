@@ -1,6 +1,7 @@
 package mail
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -87,7 +88,19 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 	if readErr != nil {
 		return readErr
 	}
+	return acknowledgeDeliveryWithLabels(workDir, beadsDir, beadID, recipientIdentity, existingLabels)
+}
 
+func acknowledgeDeliveryWithLabels(workDir, beadsDir, beadID, recipientIdentity string, existingLabels []string) error {
+	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return acknowledgeDeliveryWithLabelsContext(ctx, workDir, beadsDir, beadID, recipientIdentity, existingLabels)
+}
+
+func acknowledgeDeliveryWithLabelsContext(ctx context.Context, workDir, beadsDir, beadID, recipientIdentity string, existingLabels []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	state, _, _ := ParseDeliveryLabels(existingLabels)
 	if state == "" {
 		return nil
@@ -95,12 +108,16 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 
 	toWrite := deliveryAckLabelsToWrite(recipientIdentity, timeNow().UTC(), existingLabels)
 	for _, label := range toWrite {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		args := []string{"label", "add", beadID, label}
-		ctx, cancel := bdWriteCtx()
 		_, err := runBdCommand(ctx, args, workDir, beadsDir)
-		cancel()
 		if err == nil {
 			continue // bd label add silently succeeds on duplicate labels.
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
 		if bdErr, ok := err.(*bdError); ok && (bdErr.ContainsError("not found") || bdErr.ContainsError("no issue found")) {
 			return ErrMessageNotFound
@@ -110,7 +127,7 @@ func AcknowledgeDeliveryBead(workDir, beadsDir, beadID, recipientIdentity string
 
 	labelsAfterAck := append(append([]string{}, existingLabels...), toWrite...)
 	if deliveryPendingRemovalNeeded(labelsAfterAck) {
-		return removeDeliveryPendingLabel(workDir, beadsDir, beadID)
+		return removeDeliveryPendingLabelContext(ctx, workDir, beadsDir, beadID)
 	}
 	return nil
 }
@@ -130,12 +147,22 @@ func deliveryPendingRemovalNeeded(labels []string) bool {
 }
 
 func removeDeliveryPendingLabel(workDir, beadsDir, beadID string) error {
-	args := []string{"label", "remove", beadID, DeliveryLabelPending}
 	ctx, cancel := bdWriteCtx()
+	defer cancel()
+	return removeDeliveryPendingLabelContext(ctx, workDir, beadsDir, beadID)
+}
+
+func removeDeliveryPendingLabelContext(ctx context.Context, workDir, beadsDir, beadID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	args := []string{"label", "remove", beadID, DeliveryLabelPending}
 	_, err := runBdCommand(ctx, args, workDir, beadsDir)
-	cancel()
 	if err == nil {
 		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
 	if bdErr, ok := err.(*bdError); ok {
 		switch {
