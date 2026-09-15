@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/steveyegge/gastown/internal/beads"
 )
 
 // TestHookPolecatEnvCheck verifies that the polecat guard in runHook uses
@@ -162,6 +165,219 @@ func TestNormalizeHookShowTarget(t *testing.T) {
 	}
 }
 
+func TestScanAllRigsForHookedBeadsEmptyIsBoundedAndParallel(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	writeSlowEmptyHookBDStub(t, binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_LOG", logPath)
+	t.Setenv("GT_BD_TIMEOUT_SEC", "5")
+
+	oldTimeout := hookCrossRigScanTimeout
+	hookCrossRigScanTimeout = 2 * time.Second
+	t.Cleanup(func() {
+		hookCrossRigScanTimeout = oldTimeout
+	})
+
+	townRoot := t.TempDir()
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	routes := []beads.Route{
+		{Prefix: "a-", Path: "rig-a"},
+		{Prefix: "b-", Path: "rig-b"},
+		{Prefix: "c-", Path: "rig-c"},
+	}
+	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	for _, route := range routes {
+		if err := os.MkdirAll(filepath.Join(townRoot, route.Path, ".beads"), 0755); err != nil {
+			t.Fatalf("mkdir route beads: %v", err)
+		}
+	}
+
+	start := time.Now()
+	got := scanAllRigsForHookedBeads(townRoot, "deacon")
+	elapsed := time.Since(start)
+	if len(got) != 0 {
+		t.Fatalf("scanAllRigsForHookedBeads returned %d beads, want none", len(got))
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Fatalf("scan took %v, expected concurrent route checks to finish near one stub delay", elapsed)
+	}
+
+	log := readHookStubLog(t, logPath)
+	if count := strings.Count(log, "assignee=\"deacon\""); count != len(routes) {
+		t.Fatalf("query count = %d, want %d\nlog:\n%s", count, len(routes), log)
+	}
+	if strings.Contains(log, "args:[list]") {
+		t.Fatalf("scan used serial list fallback, want query-only lookup\nlog:\n%s", log)
+	}
+}
+
+func TestRunMoleculeStatusEmptyTownHookJSONScansPromptly(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	writeSlowEmptyHookBDStub(t, binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_LOG", logPath)
+	t.Setenv("GT_BD_TIMEOUT_SEC", "5")
+	t.Setenv("GT_ROLE", "deacon")
+
+	oldTimeout := hookCrossRigScanTimeout
+	hookCrossRigScanTimeout = 2 * time.Second
+	t.Cleanup(func() {
+		hookCrossRigScanTimeout = oldTimeout
+	})
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"type":"town","version":1,"name":"hook-test"}`), 0644); err != nil {
+		t.Fatalf("write town config: %v", err)
+	}
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	routes := []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "a-", Path: "rig-a"},
+		{Prefix: "b-", Path: "rig-b"},
+		{Prefix: "c-", Path: "rig-c"},
+	}
+	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	for _, route := range routes[1:] {
+		if err := os.MkdirAll(filepath.Join(townRoot, route.Path, ".beads"), 0755); err != nil {
+			t.Fatalf("mkdir route beads: %v", err)
+		}
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(filepath.Join(townRoot, "deacon")); err != nil {
+		if mkErr := os.MkdirAll(filepath.Join(townRoot, "deacon"), 0755); mkErr != nil {
+			t.Fatalf("mkdir deacon dir: %v", mkErr)
+		}
+		if chErr := os.Chdir(filepath.Join(townRoot, "deacon")); chErr != nil {
+			t.Fatalf("chdir deacon dir: %v", chErr)
+		}
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+	})
+
+	prevJSON := moleculeJSON
+	moleculeJSON = true
+	t.Cleanup(func() {
+		moleculeJSON = prevJSON
+	})
+
+	start := time.Now()
+	out := captureStdout(t, func() {
+		if err := runMoleculeStatus(nil, nil); err != nil {
+			t.Fatalf("runMoleculeStatus: %v", err)
+		}
+	})
+	elapsed := time.Since(start)
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("runMoleculeStatus took %v, want prompt empty-hook response", elapsed)
+	}
+	if !strings.Contains(out, `"target": "deacon/"`) || !strings.Contains(out, `"has_work": false`) {
+		t.Fatalf("unexpected JSON output:\n%s", out)
+	}
+
+	log := readHookStubLog(t, logPath)
+	if count := strings.Count(log, "assignee=\"deacon/\""); count != len(routes) {
+		t.Fatalf("cross-rig query count = %d, want %d\nlog:\n%s", count, len(routes), log)
+	}
+	if strings.Contains(log, "args:[list]") {
+		t.Fatalf("runMoleculeStatus used serial list fallback, want query-only lookup\nlog:\n%s", log)
+	}
+}
+
+func TestHookShowEmptyTownHookJSONScansPromptly(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	writeSlowEmptyHookBDStub(t, binDir)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_STUB_LOG", logPath)
+	t.Setenv("GT_BD_TIMEOUT_SEC", "5")
+
+	oldTimeout := hookCrossRigScanTimeout
+	hookCrossRigScanTimeout = 2 * time.Second
+	t.Cleanup(func() {
+		hookCrossRigScanTimeout = oldTimeout
+	})
+
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, "mayor"), 0755); err != nil {
+		t.Fatalf("mkdir mayor dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townRoot, "mayor", "town.json"), []byte(`{"type":"town","version":1,"name":"hook-test"}`), 0644); err != nil {
+		t.Fatalf("write town config: %v", err)
+	}
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	routes := []beads.Route{
+		{Prefix: "hq-", Path: "."},
+		{Prefix: "a-", Path: "rig-a"},
+		{Prefix: "b-", Path: "rig-b"},
+		{Prefix: "c-", Path: "rig-c"},
+	}
+	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+	for _, route := range routes[1:] {
+		if err := os.MkdirAll(filepath.Join(townRoot, route.Path, ".beads"), 0755); err != nil {
+			t.Fatalf("mkdir route beads: %v", err)
+		}
+	}
+
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	deaconDir := filepath.Join(townRoot, "deacon")
+	if err := os.MkdirAll(deaconDir, 0755); err != nil {
+		t.Fatalf("mkdir deacon dir: %v", err)
+	}
+	if err := os.Chdir(deaconDir); err != nil {
+		t.Fatalf("chdir deacon dir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(oldWD)
+	})
+
+	prevJSON := moleculeJSON
+	moleculeJSON = true
+	t.Cleanup(func() {
+		moleculeJSON = prevJSON
+	})
+
+	start := time.Now()
+	out := captureStdout(t, func() {
+		if err := runHookShow(nil, []string{"deacon"}); err != nil {
+			t.Fatalf("runHookShow: %v", err)
+		}
+	})
+	elapsed := time.Since(start)
+	if elapsed >= 2500*time.Millisecond {
+		t.Fatalf("runHookShow took %v, want prompt empty-hook response", elapsed)
+	}
+	if !strings.Contains(out, `"agent":"deacon/"`) || !strings.Contains(out, `"status":"empty"`) {
+		t.Fatalf("unexpected JSON output:\n%s", out)
+	}
+
+	log := readHookStubLog(t, logPath)
+	if count := strings.Count(log, "assignee=\"deacon/\""); count != len(routes) {
+		t.Fatalf("cross-rig query count = %d, want %d\nlog:\n%s", count, len(routes), log)
+	}
+	if strings.Contains(log, "args:[list]") {
+		t.Fatalf("runHookShow used serial list fallback, want query-only lookup\nlog:\n%s", log)
+	}
+}
+
 func TestCloseCompletedHookedMoleculeUsesBdCmdEnv(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "bd.log")
@@ -197,6 +413,35 @@ func TestCloseCompletedHookedMoleculeUsesBdCmdEnv(t *testing.T) {
 		if !strings.Contains(log, want) {
 			t.Fatalf("hook close log missing %q:\n%s", want, log)
 		}
+	}
+}
+
+func writeSlowEmptyHookBDStub(t *testing.T, binDir string) {
+	t.Helper()
+	script := `#!/usr/bin/env sh
+line="args:"
+for arg in "$@"; do
+	line="${line}[$arg]"
+done
+printf '%s\n' "$line" >> "$BD_STUB_LOG"
+case "$1" in
+  version)
+    printf 'bd test\n'
+    ;;
+  *)
+    for arg in "$@"; do
+      if [ "$arg" = "query" ]; then
+        sleep 1
+        printf '[]\n'
+        exit 0
+      fi
+    done
+    printf '[]\n'
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -97,6 +97,26 @@ func TestListIssueStatusesUsesSingleQuery(t *testing.T) {
 	}
 }
 
+func TestListAssignedStatusesUsesSingleQuery(t *testing.T) {
+	ResetBdAllowStaleCacheForTest()
+	logPath := installMockBDRecorder(t)
+
+	b := New(t.TempDir())
+	_, err := b.ListAssignedStatuses("gastown/polecats/toast", IssueStatusHooked, StatusInProgress, StatusInProgress)
+	if err != nil {
+		t.Fatalf("ListAssignedStatuses() error = %v", err)
+	}
+
+	logOutput := readMockBDLog(t, logPath)
+	want := `query --json (ephemeral=false OR ephemeral=true) AND assignee="gastown/polecats/toast" AND (status="hooked" OR status="in_progress") --all --limit=0`
+	if !strings.Contains(logOutput, want) {
+		t.Fatalf("bd log missing %q\nlog:\n%s", want, logOutput)
+	}
+	if count := strings.Count(logOutput, "query --json"); count != 1 {
+		t.Fatalf("query count = %d, want 1\nlog:\n%s", count, logOutput)
+	}
+}
+
 func TestListDurableUsesBDListFilters(t *testing.T) {
 	ResetBdAllowStaleCacheForTest()
 	logPath := installMockBDRecorder(t)

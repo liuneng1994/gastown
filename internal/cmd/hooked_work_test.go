@@ -97,6 +97,19 @@ func TestActiveWorkStatusesPreferHookedOverInProgress(t *testing.T) {
 	}
 }
 
+func TestSelectAssignedActiveWorkPrefersHookedOverNewerInProgress(t *testing.T) {
+	got := selectAssignedActiveWork([]*beads.Issue{
+		{ID: "gt-newer", Status: string(beads.StatusInProgress), UpdatedAt: "2026-01-02T00:00:00Z"},
+		{ID: "gt-hooked", Status: beads.StatusHooked, UpdatedAt: "2026-01-01T00:00:00Z"},
+	})
+	if len(got) != 1 {
+		t.Fatalf("selectAssignedActiveWork length = %d, want 1", len(got))
+	}
+	if got[0].ID != "gt-hooked" {
+		t.Fatalf("selectAssignedActiveWork chose %q, want hooked bead", got[0].ID)
+	}
+}
+
 func TestActiveWorkMergeBeadListsDedupeAndSort(t *testing.T) {
 	primary := []*beads.Issue{
 		{ID: "gt-older", UpdatedAt: "2026-01-01T00:00:00Z"},

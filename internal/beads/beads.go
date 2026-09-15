@@ -759,11 +759,19 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 	return b.runWithStdin(nil, args...)
 }
 
+func (b *Beads) runWithContext(ctx context.Context, args ...string) ([]byte, error) {
+	return b.runWithStdinContext(ctx, nil, args...)
+}
+
 // runWithStdin executes a bd command, optionally piping stdinData to bd's stdin.
 // When stdinData is nil, behaves identically to run. Use this for flags like
 // --body-file=- that read multi-line content from stdin (avoids embedding
 // newlines in --description, which bd 1.0.3+ rejects).
 func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr error) {
+	return b.runWithStdinContext(context.Background(), stdinData, args...)
+}
+
+func (b *Beads) runWithStdinContext(ctx context.Context, stdinData []byte, args ...string) (_ []byte, retErr error) {
 	start := time.Now()
 	// Declare buffers before defer so the closure captures them after cmd.Run.
 	var stdout, stderr bytes.Buffer
@@ -780,10 +788,13 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	runEnv := b.buildCommandEnv(beadsDir, args)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
 	// The context covers both the initial attempt and the --flat retry.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	ctx, cancel := context.WithTimeout(ctx, resolveBdSubprocessTimeout())
 	defer cancel()
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
@@ -1180,6 +1191,98 @@ func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
 		return nil, fmt.Errorf("parsing bd query output: %w", err)
 	}
 	return issues, nil
+}
+
+// ListAssignedStatusesContext is ListAssignedStatuses with caller-provided
+// cancellation. It is used by cross-rig scans so a slow database cannot block
+// hook status indefinitely.
+func (b *Beads) ListAssignedStatusesContext(ctx context.Context, assignee string, statuses ...IssueStatus) ([]*Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(assignee) == "" || len(statuses) == 0 {
+		return nil, nil
+	}
+
+	unique := make([]IssueStatus, 0, len(statuses))
+	seen := make(map[IssueStatus]bool, len(statuses))
+	for _, status := range statuses {
+		if status == "" || seen[status] {
+			continue
+		}
+		seen[status] = true
+		unique = append(unique, status)
+	}
+	if len(unique) == 0 {
+		return nil, nil
+	}
+
+	if b.store != nil {
+		var all []*Issue
+		for _, status := range unique {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			issues, err := b.storeList(ListOptions{
+				Status:    string(status),
+				Assignee:  assignee,
+				Priority:  -1,
+				Ephemeral: false,
+			})
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, issues...)
+
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			wisps, err := b.storeList(ListOptions{
+				Status:    string(status),
+				Assignee:  assignee,
+				Priority:  -1,
+				Ephemeral: true,
+			})
+			if err != nil {
+				return nil, err
+			}
+			all = append(all, wisps...)
+		}
+		return all, nil
+	}
+
+	statusClauses := make([]string, 0, len(unique))
+	for _, status := range unique {
+		statusClauses = append(statusClauses, "status="+quoteBDQueryValue(string(status)))
+	}
+	expr := "(ephemeral=false OR ephemeral=true) AND assignee=" + quoteBDQueryValue(assignee) +
+		" AND (" + strings.Join(statusClauses, " OR ") + ")"
+	out, err := b.runWithContext(ctx, "query", "--json", expr, "--all", "--limit=0")
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	if !isJSONBytes(out) {
+		return nil, fmt.Errorf("bd query returned non-JSON output")
+	}
+
+	var issues []*Issue
+	if err := json.Unmarshal(out, &issues); err != nil {
+		return nil, fmt.Errorf("parsing bd query output: %w", err)
+	}
+	return issues, nil
+}
+
+// ListAssignedStatuses returns durable and ephemeral issues assigned to assignee
+// with any of the supplied statuses using one bd query. Hook status paths use
+// this to avoid multiplying subprocesses by status and table.
+func (b *Beads) ListAssignedStatuses(assignee string, statuses ...IssueStatus) ([]*Issue, error) {
+	return b.ListAssignedStatusesContext(context.Background(), assignee, statuses...)
 }
 
 // listEphemeral searches the wisps table using "bd query" with ephemeral=true.
