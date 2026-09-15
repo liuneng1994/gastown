@@ -1,9 +1,12 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -17,6 +20,12 @@ var (
 	patrolReportSummary string
 	patrolReportSteps   string
 )
+
+var patrolReportCommandTimeout = 4 * time.Second
+
+var newPatrolReportCommandContext = func() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), patrolReportCommandTimeout)
+}
 
 var patrolReportCmd = &cobra.Command{
 	Use:   "report",
@@ -45,6 +54,9 @@ func init() {
 }
 
 func runPatrolReport(cmd *cobra.Command, args []string) error {
+	ctx, cancel := newPatrolReportCommandContext()
+	defer cancel()
+
 	// Resolve role
 	roleInfo, err := GetRole()
 	if err != nil {
@@ -83,12 +95,12 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	}
 
 	// Find the active patrol
-	patrolID, _, hasPatrol, findErr := findActivePatrol(cfg)
+	patrolID, _, hasPatrol, findErr := findActivePatrolContext(ctx, cfg)
 	if findErr != nil {
-		return fmt.Errorf("finding active patrol: %w", findErr)
+		return patrolReportPhaseError(ctx, "finding active patrol", findErr)
 	}
 	if !hasPatrol {
-		return fmt.Errorf("no active patrol found for %s", cfg.RoleName)
+		return recoverMissingPatrol(cfg)
 	}
 
 	// Close the current patrol root with the summary
@@ -102,7 +114,7 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 
 	// Update the description with the patrol summary and step audit
 	desc := fmt.Sprintf("Patrol report: %s\n\n%s", patrolReportSummary, stepAudit)
-	if err := b.Update(patrolID, beads.UpdateOptions{
+	if err := b.UpdateContext(ctx, patrolID, beads.UpdateOptions{
 		Description: &desc,
 	}); err != nil {
 		style.PrintWarning("could not update patrol summary: %v", err)
@@ -114,20 +126,20 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 	// Close all descendant wisps first (recursive), then the patrol root.
 	// Without this, every patrol cycle leaks ~10 orphan wisps into the DB.
 	// If descendants can't be closed, abort so patrol retries next cycle (gt-7lx3).
-	closed, closeDescErr := forceCloseDescendants(b, patrolID)
+	closed, closeDescErr := forceCloseDescendantsContext(ctx, b, patrolID)
 	if closeDescErr != nil {
-		return fmt.Errorf("closing descendants of patrol %s (closed %d): %w", patrolID, closed, closeDescErr)
+		return patrolReportPhaseError(ctx, fmt.Sprintf("closing descendants of patrol %s (closed %d)", patrolID, closed), closeDescErr)
 	}
 
 	// Close the patrol root
-	if err := b.ForceCloseWithReason("patrol cycle complete: "+patrolReportSummary, patrolID); err != nil {
-		return fmt.Errorf("closing patrol %s: %w", patrolID, err)
+	if err := b.ForceCloseWithReasonContext(ctx, "patrol cycle complete: "+patrolReportSummary, patrolID); err != nil {
+		return patrolReportPhaseError(ctx, "closing patrol "+patrolID, err)
 	}
 
 	fmt.Printf("%s Closed patrol %s\n", style.Success.Render("✓"), patrolID)
 
 	// Start next cycle
-	newPatrolID, err := autoSpawnPatrol(cfg)
+	newPatrolID, err := spawnReplacementPatrol(cfg)
 	if err != nil {
 		if newPatrolID != "" {
 			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
@@ -142,6 +154,40 @@ func runPatrolReport(cmd *cobra.Command, args []string) error {
 		stampDeaconHeartbeatOnReport(cfg.BeadsDir, patrolReportSummary)
 	}
 	return nil
+}
+
+func recoverMissingPatrol(cfg PatrolConfig) error {
+	fmt.Printf("%s No active patrol found for %s; creating replacement patrol...\n", style.Warning.Render("⚠"), cfg.RoleName)
+	newPatrolID, err := spawnReplacementPatrol(cfg)
+	if err != nil {
+		if newPatrolID != "" {
+			fmt.Fprintf(os.Stderr, "warning: %s\n", err.Error())
+			fmt.Printf("New patrol: %s\n", newPatrolID)
+			return nil
+		}
+		return fmt.Errorf("recovering missing patrol for %s: %w", cfg.RoleName, err)
+	}
+	fmt.Printf("%s Recovered patrol: %s\n", style.Success.Render("✓"), newPatrolID)
+	if cfg.RoleName == "deacon" {
+		stampDeaconHeartbeatOnReport(cfg.BeadsDir, "recovered missing patrol")
+	}
+	return nil
+}
+
+func spawnReplacementPatrol(cfg PatrolConfig) (string, error) {
+	spawnCtx, spawnCancel := newPatrolReportCommandContext()
+	defer spawnCancel()
+	return autoSpawnPatrolContext(spawnCtx, cfg)
+}
+
+func patrolReportPhaseError(ctx context.Context, phase string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("%s timed out after %s: %w", phase, patrolReportCommandTimeout, err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return fmt.Errorf("%s canceled: %w", phase, err)
+	}
+	return fmt.Errorf("%s: %w", phase, err)
 }
 
 func stampDeaconHeartbeatOnReport(townRoot, summary string) {

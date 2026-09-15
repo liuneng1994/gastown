@@ -2,10 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 )
@@ -86,5 +90,82 @@ func TestOutputMoleculeStatus_FormulaWispShowsWorkflowContext(t *testing.T) {
 	}
 	if !strings.Contains(output, "Show the workflow steps: gt prime or bd mol current tool-wisp-demo") {
 		t.Fatalf("expected workflow next action, got:\n%s", output)
+	}
+}
+
+func TestGetMoleculeProgressInfoContextCancelsChildListing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake bd")
+	}
+
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "list-started")
+	writeBDStub(t, binDir, `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+case "$1" in
+  show)
+    printf '%s\n' '[{"id":"gt-wisp-root","title":"mol-patrol","description":"","status":"hooked","priority":2,"issue_type":"task","created_at":"2026-09-15T00:00:00Z","updated_at":"2026-09-15T00:00:00Z"}]'
+    ;;
+  list)
+    : > "$BD_LIST_STARTED"
+    sleep 60
+    ;;
+  *)
+    printf 'unexpected bd args: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+`, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_LIST_STARTED", started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := getMoleculeProgressInfoContext(ctx, beads.New(workDir), "gt-wisp-root")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("getMoleculeProgressInfoContext returned nil, want cancellation error")
+	}
+	if !strings.Contains(err.Error(), "listing children") {
+		t.Fatalf("error = %v, want child-listing phase", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("getMoleculeProgressInfoContext took %s, want bounded by caller context", elapsed)
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("fake bd list was not invoked: %v", statErr)
+	}
+}
+
+func TestShouldRetryMoleculeStatusLookupRequiresBackoffBudget(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(50*time.Millisecond))
+	defer cancel()
+	if shouldRetryMoleculeStatusLookup(ctx, 100*time.Millisecond) {
+		t.Fatal("expected retry to stop when remaining deadline cannot cover backoff")
+	}
+
+	ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(time.Second))
+	defer cancel()
+	if !shouldRetryMoleculeStatusLookup(ctx, 10*time.Millisecond) {
+		t.Fatal("expected retry when deadline can cover backoff")
+	}
+
+	cancel()
+	if shouldRetryMoleculeStatusLookup(ctx, 0) {
+		t.Fatal("expected retry to stop after context cancellation")
 	}
 }

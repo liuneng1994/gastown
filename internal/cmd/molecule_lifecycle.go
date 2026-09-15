@@ -283,9 +283,9 @@ squashed_at: %s
 			Title:       digestTitle,
 			Description: digestDesc,
 			Labels:      []string{"gt:task"},
-			Priority:    4,       // P4 - backlog priority for digests
+			Priority:    4, // P4 - backlog priority for digests
 			Actor:       target,
-			Ephemeral:   true,    // Don't export to JSONL - daily aggregation handles permanent record
+			Ephemeral:   true, // Don't export to JSONL - daily aggregation handles permanent record
 		})
 		if err != nil {
 			return fmt.Errorf("creating digest: %w", err)
@@ -360,7 +360,11 @@ squashed_at: %s
 // closeDescendants recursively closes all descendant issues of a parent.
 // Returns the count of issues closed. Logs warnings on errors but doesn't fail.
 func closeDescendants(b *beads.Beads, parentID string) int {
-	count, err := closeDescendantsImpl(b, parentID, false)
+	return closeDescendantsContext(context.Background(), b, parentID)
+}
+
+func closeDescendantsContext(ctx context.Context, b *beads.Beads, parentID string) int {
+	count, err := closeDescendantsImplContext(ctx, b, parentID, false)
 	if err != nil {
 		style.PrintWarning("closing descendants of %s: %v", parentID, err)
 	}
@@ -372,11 +376,26 @@ func closeDescendants(b *beads.Beads, parentID string) int {
 // issues closed and any error encountered. Callers should check the error
 // to avoid closing a parent while children survive (gt-7lx3).
 func forceCloseDescendants(b *beads.Beads, parentID string) (int, error) {
-	return closeDescendantsImpl(b, parentID, true)
+	return forceCloseDescendantsContext(context.Background(), b, parentID)
 }
 
 func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, error) {
-	children, err := b.List(beads.ListOptions{
+	return closeDescendantsImplContext(context.Background(), b, parentID, force)
+}
+
+func forceCloseDescendantsContext(ctx context.Context, b *beads.Beads, parentID string) (int, error) {
+	return closeDescendantsImplContext(ctx, b, parentID, true)
+}
+
+func closeDescendantsImplContext(ctx context.Context, b *beads.Beads, parentID string, force bool) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+
+	children, err := b.ListContext(ctx, beads.ListOptions{
 		Parent: parentID,
 		Status: "all",
 	})
@@ -392,7 +411,11 @@ func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, err
 	totalClosed := 0
 	var errs []error
 	for _, child := range children {
-		closed, childErr := closeDescendantsImpl(b, child.ID, force)
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, err)
+			break
+		}
+		closed, childErr := closeDescendantsImplContext(ctx, b, child.ID, force)
 		totalClosed += closed
 		if childErr != nil {
 			errs = append(errs, childErr)
@@ -410,9 +433,9 @@ func closeDescendantsImpl(b *beads.Beads, parentID string, force bool) (int, err
 	if len(idsToClose) > 0 {
 		var closeErr error
 		if force {
-			closeErr = b.ForceCloseWithReason("burned: force-close descendants", idsToClose...)
+			closeErr = b.ForceCloseWithReasonContext(ctx, "burned: force-close descendants", idsToClose...)
 		} else {
-			closeErr = b.Close(idsToClose...)
+			closeErr = b.CloseContext(ctx, idsToClose...)
 		}
 		if closeErr != nil {
 			errs = append(errs, fmt.Errorf("closing children of %s: %w", parentID, closeErr))

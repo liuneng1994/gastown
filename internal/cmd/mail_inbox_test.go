@@ -517,6 +517,60 @@ func TestRunMailReadReturnsPhaseSpecificListTimeoutForIndex(t *testing.T) {
 	}
 }
 
+type fakeMailDeleteMailbox struct {
+	deleteCalls    int
+	lastContext    context.Context
+	blockDelete    bool
+	cancelOnDelete context.CancelFunc
+}
+
+func (f *fakeMailDeleteMailbox) ListContext(ctx context.Context) ([]*mail.Message, error) {
+	return nil, nil
+}
+
+func (f *fakeMailDeleteMailbox) DeleteContext(ctx context.Context, id string) error {
+	f.deleteCalls++
+	f.lastContext = ctx
+	if f.cancelOnDelete != nil {
+		f.cancelOnDelete()
+	}
+	if f.blockDelete {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return nil
+}
+
+func TestRunMailDeleteUsesSharedCommandContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	box := &fakeMailDeleteMailbox{blockDelete: true, cancelOnDelete: cancel}
+	start := time.Now()
+	stdout := captureStdout(t, func() {
+		err := runMailDeleteWithMailbox(ctx, box, []string{"msg-slow"}, os.Stdout)
+		if err == nil {
+			t.Fatal("runMailDeleteWithMailbox returned nil, want cancellation error")
+		}
+		if !strings.Contains(err.Error(), "failed to delete 1 messages") {
+			t.Fatalf("error = %v, want delete failure", err)
+		}
+	})
+	elapsed := time.Since(start)
+	if !strings.Contains(stdout, "deleting message canceled") {
+		t.Fatalf("stdout = %q, want deleting phase cancellation", stdout)
+	}
+	if box.lastContext != ctx {
+		t.Fatal("DeleteContext did not receive command context")
+	}
+	if box.deleteCalls != 1 {
+		t.Fatalf("DeleteContext calls = %d, want 1", box.deleteCalls)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("runMailDeleteWithMailbox took %s after canceled context", elapsed)
+	}
+}
+
 func waitForPath(t *testing.T, path string, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

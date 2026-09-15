@@ -20,6 +20,8 @@ type mockStorage struct {
 	nextID          int
 	prefix          string
 	closed          map[string]bool
+	lastSearchCtx   context.Context
+	lastCloseCtx    context.Context
 	closeErr        error
 	createErr       error
 	updateErr       error
@@ -130,7 +132,8 @@ func (m *mockStorage) UpdateIssue(_ context.Context, id string, updates map[stri
 	return nil
 }
 
-func (m *mockStorage) CloseIssue(_ context.Context, id, reason, actor, session string) error {
+func (m *mockStorage) CloseIssue(ctx context.Context, id, reason, actor, session string) error {
+	m.lastCloseCtx = ctx
 	if m.closeErr != nil {
 		return m.closeErr
 	}
@@ -150,7 +153,8 @@ func (m *mockStorage) DeleteIssue(_ context.Context, id string) error {
 	return nil
 }
 
-func (m *mockStorage) SearchIssues(_ context.Context, query string, filter beadsdk.IssueFilter) ([]*beadsdk.Issue, error) {
+func (m *mockStorage) SearchIssues(ctx context.Context, query string, filter beadsdk.IssueFilter) ([]*beadsdk.Issue, error) {
+	m.lastSearchCtx = ctx
 	if m.searchErr != nil {
 		return nil, m.searchErr
 	}
@@ -297,6 +301,51 @@ func (m *mockStorage) Close() error { return nil }
 
 func newTestBeads(store *mockStorage) *Beads {
 	return &Beads{workDir: "/tmp/test", store: store, isolated: true}
+}
+
+func TestLegacyStoreWrappersKeepDefaultDeadline(t *testing.T) {
+	store := newMockStorage()
+	b := newTestBeads(store)
+
+	store.CreateIssue(context.Background(), &beadsdk.Issue{Title: "closable"}, "actor")
+
+	before := time.Now()
+	if _, err := b.List(ListOptions{}); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	deadline, ok := store.lastSearchCtx.Deadline()
+	if !ok {
+		t.Fatal("List did not use a deadline for store-backed operation")
+	}
+	if deadline.Before(before.Add(29*time.Second)) || deadline.After(before.Add(31*time.Second)) {
+		t.Fatalf("List deadline = %s, want about 30s from %s", deadline.Sub(before), before)
+	}
+
+	explicitDeadline := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), explicitDeadline)
+	defer cancel()
+	if _, err := b.ListContext(ctx, ListOptions{}); err != nil {
+		t.Fatalf("ListContext: %v", err)
+	}
+	deadline, ok = store.lastSearchCtx.Deadline()
+	if !ok {
+		t.Fatal("ListContext did not pass explicit deadline")
+	}
+	if !deadline.Equal(explicitDeadline) {
+		t.Fatalf("ListContext deadline = %s, want %s", deadline, explicitDeadline)
+	}
+
+	before = time.Now()
+	if err := b.Close("test-1"); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	deadline, ok = store.lastCloseCtx.Deadline()
+	if !ok {
+		t.Fatal("Close did not use a deadline for store-backed operation")
+	}
+	if deadline.Before(before.Add(29*time.Second)) || deadline.After(before.Add(31*time.Second)) {
+		t.Fatalf("Close deadline = %s, want about 30s from %s", deadline.Sub(before), before)
+	}
 }
 
 func TestStoreList(t *testing.T) {

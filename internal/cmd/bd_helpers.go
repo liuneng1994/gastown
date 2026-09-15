@@ -21,6 +21,7 @@ import (
 type bdCmd struct {
 	args       []string
 	dir        string
+	ctx        context.Context
 	env        []string
 	stdin      io.Reader
 	stderr     io.Writer
@@ -84,6 +85,14 @@ func (b *bdCmd) WithBeadsDir(dir string) *bdCmd {
 // WithBeadsDir supplies a more specific database.
 func (b *bdCmd) Dir(dir string) *bdCmd {
 	b.dir = dir
+	return b
+}
+
+// Context sets a caller-owned deadline/cancellation context for this command.
+// Run/Output/CombinedOutput still apply the standard bd command timeout as an
+// upper bound, but return sooner when this context is canceled.
+func (b *bdCmd) Context(ctx context.Context) *bdCmd {
+	b.ctx = ctx
 	return b
 }
 
@@ -168,6 +177,12 @@ func (b *bdCmd) buildEnv() []string {
 func (b *bdCmd) Build() *exec.Cmd {
 	args := b.resolvedArgs()
 	cmd := exec.Command("bd", args...)
+	if b.ctx != nil {
+		cmd = exec.CommandContext(b.ctx, "bd", args...)
+		util.SetProcessGroup(cmd)
+	} else {
+		util.SetDetachedProcessGroup(cmd)
+	}
 	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
 	cmd.Stdin = b.stdin
@@ -257,7 +272,11 @@ func (b *bdCmd) resolvedArgs() []string {
 // This is a convenience method equivalent to Build().Run().
 func (b *bdCmd) Run() error {
 	deadline := resolveBdCmdTimeout()
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	base := b.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, deadline)
 	defer cancel()
 	return b.wrapCommandError(ctx, b.buildContextCommand(ctx).Run(), deadline)
 }
@@ -268,7 +287,11 @@ func (b *bdCmd) Run() error {
 // separately if you want to capture stderr instead of it going to os.Stderr.
 func (b *bdCmd) Output() ([]byte, error) {
 	deadline := resolveBdCmdTimeout()
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	base := b.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, deadline)
 	defer cancel()
 	out, err := b.buildContextCommand(ctx).Output()
 	return out, b.wrapCommandError(ctx, err, deadline)
@@ -279,7 +302,11 @@ func (b *bdCmd) Output() ([]byte, error) {
 // Useful for including command output in error messages.
 func (b *bdCmd) CombinedOutput() ([]byte, error) {
 	deadline := resolveBdCmdTimeout()
-	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	base := b.ctx
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, deadline)
 	defer cancel()
 	args := b.resolvedArgs()
 	cmd := exec.CommandContext(ctx, "bd", args...)

@@ -2,6 +2,8 @@ package cmd
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,6 +222,39 @@ timeout /t 5 /nobreak >NUL
 	}
 	if elapsed > 4*time.Second {
 		t.Fatalf("timeout took %v, want under 4s", elapsed)
+	}
+}
+
+func TestBdCmd_BuildHonorsCallerContext(t *testing.T) {
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "started")
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+: > "$BD_CMD_STARTED"
+sleep 60
+`, `@echo off
+echo started > %BD_CMD_STARTED%
+timeout /t 60 /nobreak >NUL
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CMD_STARTED", started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := BdCmd("mol", "wisp", "create", "mol-test").Context(ctx).Build().Run()
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Build().Run returned nil, want cancellation error")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("context error = %v, want deadline exceeded", ctx.Err())
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Build().Run took %s, want bounded by caller context", elapsed)
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("fake bd was not invoked: %v", statErr)
 	}
 }
 

@@ -759,11 +759,19 @@ func (b *Beads) run(args ...string) ([]byte, error) {
 	return b.runWithStdin(nil, args...)
 }
 
+func (b *Beads) runWithContext(ctx context.Context, args ...string) ([]byte, error) {
+	return b.runWithStdinContext(ctx, nil, args...)
+}
+
 // runWithStdin executes a bd command, optionally piping stdinData to bd's stdin.
 // When stdinData is nil, behaves identically to run. Use this for flags like
 // --body-file=- that read multi-line content from stdin (avoids embedding
 // newlines in --description, which bd 1.0.3+ rejects).
 func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr error) {
+	return b.runWithStdinContext(context.Background(), stdinData, args...)
+}
+
+func (b *Beads) runWithStdinContext(ctx context.Context, stdinData []byte, args ...string) (_ []byte, retErr error) {
 	start := time.Now()
 	// Declare buffers before defer so the closure captures them after cmd.Run.
 	var stdout, stderr bytes.Buffer
@@ -785,14 +793,17 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
 	// blocking forever (under memory pressure that invites Jetsam SIGKILL).
 	// The context covers both the initial attempt and the --flat retry.
-	ctx, cancel := context.WithTimeout(context.Background(), resolveBdSubprocessTimeout())
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, resolveBdSubprocessTimeout())
 	defer cancel()
 
 	// Always explicitly set BEADS_DIR to prevent inherited env vars from
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
 	// resolve from working directory.
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -819,7 +830,7 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 		stdout.Reset()
 		stderr.Reset()
 		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-		util.SetDetachedProcessGroup(cmd)
+		util.SetProcessGroup(cmd)
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -832,6 +843,9 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	}
 
 	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, b.wrapError(ctxErr, stderr.String(), args)
+		}
 		return nil, b.wrapError(err, stderr.String(), args)
 	}
 
@@ -864,7 +878,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -1058,16 +1072,35 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.ListContext(ctx, opts)
+}
+
+// ListContext is List with caller-provided cancellation. It lets hot control-plane
+// commands bound an entire read phase instead of waiting for the default bd
+// subprocess timeout on every serialized operation.
+func (b *Beads) ListContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if b.store != nil {
-		return b.storeList(opts)
+		return b.storeListContext(ctx, opts)
 	}
 	if opts.Ephemeral {
-		return b.listEphemeral(opts)
+		return b.listEphemeralContext(ctx, opts)
 	}
-	return b.listIssues(opts)
+	return b.listIssuesContext(ctx, opts)
 }
 
 func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
+	return b.listIssuesContext(context.Background(), opts)
+}
+
+func (b *Beads) listIssuesContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
 	args := []string{"list", "--json"}
 
 	if opts.Status != "" {
@@ -1099,7 +1132,7 @@ func (b *Beads) listIssues(opts ListOptions) ([]*Issue, error) {
 		args = append(args, "--limit=0")
 	}
 
-	out, err := b.run(args...)
+	out, err := b.runWithContext(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1173,11 +1206,67 @@ func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
 	return issues, nil
 }
 
+// ListAssignedStatusesContext is ListAssignedStatuses with caller-provided
+// cancellation. Hot control-plane paths use this to avoid multiplying the
+// default bd subprocess timeout across sequential hook lookups.
+func (b *Beads) ListAssignedStatusesContext(ctx context.Context, assignee string, statuses ...IssueStatus) ([]*Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(assignee) == "" || len(statuses) == 0 {
+		return nil, nil
+	}
+
+	var assigned []*Issue
+	for _, status := range statuses {
+		if status == "" {
+			continue
+		}
+		issues, err := b.ListContext(ctx, ListOptions{
+			Status:    string(status),
+			Assignee:  assignee,
+			Priority:  -1,
+			Ephemeral: false,
+		})
+		if err != nil {
+			return nil, err
+		}
+		assigned = append(assigned, issues...)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		wisps, err := b.ListContext(ctx, ListOptions{
+			Status:    string(status),
+			Assignee:  assignee,
+			Priority:  -1,
+			Ephemeral: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+		assigned = append(assigned, wisps...)
+	}
+	return assigned, nil
+}
+
+// ListAssignedStatuses returns durable and ephemeral issues assigned to assignee
+// with any of the supplied statuses.
+func (b *Beads) ListAssignedStatuses(assignee string, statuses ...IssueStatus) ([]*Issue, error) {
+	return b.ListAssignedStatusesContext(context.Background(), assignee, statuses...)
+}
+
 // listEphemeral searches the wisps table using "bd query" with ephemeral=true.
 // This is necessary because "bd list" only searches the issues table and does
 // not support an --ephemeral flag. Wisps (ephemeral issues like merge-request
 // beads) live in a separate table since beads v0.59.
 func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
+	return b.listEphemeralContext(context.Background(), opts)
+}
+
+func (b *Beads) listEphemeralContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
 	// Build query expression: ephemeral=true AND <filters>
 	clauses := []string{"ephemeral=true"}
 
@@ -1212,7 +1301,7 @@ func (b *Beads) listEphemeral(opts ListOptions) ([]*Issue, error) {
 		args = append(args, "--limit=0")
 	}
 
-	out, err := b.run(args...)
+	out, err := b.runWithContext(ctx, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1554,17 +1643,30 @@ func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
 
 // Show returns detailed information about an issue.
 func (b *Beads) Show(id string) (*Issue, error) {
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.ShowContext(ctx, id)
+}
+
+// ShowContext is Show with caller-provided cancellation.
+func (b *Beads) ShowContext(ctx context.Context, id string) (*Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !b.noRoute {
 		if target := b.forIssueID(id); target != b {
-			return target.Show(id)
+			return target.ShowContext(ctx, id)
 		}
 	}
 
 	if b.store != nil {
-		return b.storeShow(id)
+		return b.storeShowContext(ctx, id)
 	}
 
-	out, err := b.run("show", id, "--json")
+	out, err := b.runWithContext(ctx, "show", id, "--json")
 	if err != nil {
 		return nil, err
 	}
@@ -1616,8 +1718,21 @@ func (b *Beads) FindLatestIssueByTitleAndAssignee(title, assignee string) (*Issu
 // Returns a map of ID to Issue. Missing IDs are not included in the map.
 // If one routed group fails, successful groups are returned with the error.
 func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.ShowMultipleContext(ctx, ids)
+}
+
+// ShowMultipleContext is ShowMultiple with caller-provided cancellation.
+func (b *Beads) ShowMultipleContext(ctx context.Context, ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	if !b.noRoute {
@@ -1636,7 +1751,7 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 				if targetDir != fallbackDir {
 					target = NewWithBeadsDir(filepath.Dir(targetDir), targetDir)
 				}
-				issues, err := target.showMultipleLocal(groupIDs)
+				issues, err := target.showMultipleLocalContext(ctx, groupIDs)
 				if err != nil {
 					if firstErr == nil {
 						firstErr = err
@@ -1651,21 +1766,31 @@ func (b *Beads) ShowMultiple(ids []string) (map[string]*Issue, error) {
 		}
 	}
 
-	return b.showMultipleLocal(ids)
+	return b.showMultipleLocalContext(ctx, ids)
 }
 
 func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
+	return b.showMultipleLocalContext(context.Background(), ids)
+}
+
+func (b *Beads) showMultipleLocalContext(ctx context.Context, ids []string) (map[string]*Issue, error) {
 	if len(ids) == 0 {
 		return make(map[string]*Issue), nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if b.store != nil {
-		return b.storeShowMultiple(ids)
+		return b.storeShowMultipleContext(ctx, ids)
 	}
 
 	// bd show supports multiple IDs
 	args := append([]string{"show", "--json"}, ids...)
-	out, err := b.run(args...)
+	out, err := b.runWithContext(ctx, args...)
 	if err != nil {
 		return nil, fmt.Errorf("bd show: %w", err)
 	}
@@ -1963,14 +2088,27 @@ func normalizeBugTitle(title string) string {
 
 // Update updates an existing issue.
 func (b *Beads) Update(id string, opts UpdateOptions) error {
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.UpdateContext(ctx, id, opts)
+}
+
+// UpdateContext is Update with caller-provided cancellation.
+func (b *Beads) UpdateContext(ctx context.Context, id string, opts UpdateOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !b.noRoute {
 		if target := b.forIssueID(id); target != b {
-			return target.Update(id, opts)
+			return target.UpdateContext(ctx, id, opts)
 		}
 	}
 
 	if b.store != nil {
-		return b.storeUpdate(id, opts)
+		return b.storeUpdateContext(ctx, id, opts)
 	}
 
 	args := []string{"update", id}
@@ -2010,7 +2148,7 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
-	_, err := b.runWithStdin(stdinData, args...)
+	_, err := b.runWithStdinContext(ctx, stdinData, args...)
 	return err
 }
 
@@ -2075,26 +2213,59 @@ type closeOptions struct {
 // If a runtime session ID is set in the environment, it is passed to bd close
 // for work attribution tracking (see decision 009-session-events-architecture.md).
 func (b *Beads) Close(ids ...string) error {
-	return b.closeWithOptions(closeOptions{}, ids...)
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.CloseContext(ctx, ids...)
+}
+
+// CloseContext is Close with caller-provided cancellation.
+func (b *Beads) CloseContext(ctx context.Context, ids ...string) error {
+	return b.closeWithOptionsContext(ctx, closeOptions{}, ids...)
 }
 
 // CloseWithReason closes one or more issues with a reason.
 // If a runtime session ID is set in the environment, it is passed to bd close
 // for work attribution tracking (see decision 009-session-events-architecture.md).
 func (b *Beads) CloseWithReason(reason string, ids ...string) error {
-	return b.closeWithOptions(closeOptions{reason: reason, withReason: true}, ids...)
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.CloseWithReasonContext(ctx, reason, ids...)
+}
+
+// CloseWithReasonContext is CloseWithReason with caller-provided cancellation.
+func (b *Beads) CloseWithReasonContext(ctx context.Context, reason string, ids ...string) error {
+	return b.closeWithOptionsContext(ctx, closeOptions{reason: reason, withReason: true}, ids...)
 }
 
 // ForceCloseWithReason closes one or more issues with --force, bypassing
 // dependency checks. Used by gt done where the polecat is about to be nuked
 // and open molecule wisps should not block issue closure.
 func (b *Beads) ForceCloseWithReason(reason string, ids ...string) error {
-	return b.closeWithOptions(closeOptions{reason: reason, withReason: true, force: true}, ids...)
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.ForceCloseWithReasonContext(ctx, reason, ids...)
+}
+
+// ForceCloseWithReasonContext is ForceCloseWithReason with caller-provided cancellation.
+func (b *Beads) ForceCloseWithReasonContext(ctx context.Context, reason string, ids ...string) error {
+	return b.closeWithOptionsContext(ctx, closeOptions{reason: reason, withReason: true, force: true}, ids...)
 }
 
 func (b *Beads) closeWithOptions(opts closeOptions, ids ...string) error {
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.closeWithOptionsContext(ctx, opts, ids...)
+}
+
+func (b *Beads) closeWithOptionsContext(ctx context.Context, opts closeOptions, ids ...string) error {
 	if len(ids) == 0 {
 		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 
 	if !b.noRoute {
@@ -2109,7 +2280,10 @@ func (b *Beads) closeWithOptions(opts closeOptions, ids ...string) error {
 		}
 		if len(groups) > 1 || groups[currentDir] == nil {
 			for targetDir, groupIDs := range groups {
-				if err := targets[targetDir].closeInCurrentDB(opts, groupIDs...); err != nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if err := targets[targetDir].closeInCurrentDBContext(ctx, opts, groupIDs...); err != nil {
 					return err
 				}
 			}
@@ -2117,17 +2291,29 @@ func (b *Beads) closeWithOptions(opts closeOptions, ids ...string) error {
 		}
 	}
 
-	return b.closeInCurrentDB(opts, ids...)
+	return b.closeInCurrentDBContext(ctx, opts, ids...)
 }
 
 func (b *Beads) closeInCurrentDB(opts closeOptions, ids ...string) error {
+	ctx, cancel := b.defaultOperationContext()
+	defer cancel()
+	return b.closeInCurrentDBContext(ctx, opts, ids...)
+}
+
+func (b *Beads) closeInCurrentDBContext(ctx context.Context, opts closeOptions, ids ...string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// In-process store close doesn't enforce dependency checks (no --force
 	// needed). Note: this means the store path bypasses the dependency
 	// validation that the CLI's --force flag overrides. Callers relying on
 	// ForceCloseWithReason (e.g., gt done nuking polecat wisps) are already
 	// accepting that deps may remain dangling, so this is intentional.
 	if b.store != nil {
-		return b.storeClose(opts.reason, runtime.SessionIDFromEnv(), ids...)
+		return b.storeCloseContext(ctx, opts.reason, runtime.SessionIDFromEnv(), ids...)
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -2143,7 +2329,7 @@ func (b *Beads) closeInCurrentDB(opts closeOptions, ids ...string) error {
 		args = append(args, "--session="+sessionID)
 	}
 
-	_, err := b.run(args...)
+	_, err := b.runWithContext(ctx, args...)
 	return err
 }
 

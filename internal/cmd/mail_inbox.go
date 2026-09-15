@@ -369,6 +369,9 @@ func runMailPeek(cmd *cobra.Command, args []string) error {
 }
 
 func runMailDelete(cmd *cobra.Command, args []string) error {
+	ctx, cancel := newMailCommandContext()
+	defer cancel()
+
 	// Determine which inbox
 	address := detectSender()
 
@@ -377,31 +380,45 @@ func runMailDelete(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	return runMailDeleteWithMailbox(ctx, mailbox, args, os.Stdout)
+}
+
+func runMailDeleteWithMailbox(ctx context.Context, mailbox archiveMailbox, args []string, out io.Writer) error {
 	// Delete all specified messages
 	deleted := 0
 	var errors []string
+deleteLoop:
 	for _, msgID := range args {
-		if err := mailbox.Delete(msgID); err != nil {
-			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
-		} else {
+		if err := ctx.Err(); err != nil {
+			errors = append(errors, fmt.Sprintf("%s: %v", msgID, mailCommandPhaseError(ctx, "deleting message", err)))
+			break
+		}
+		err := mailbox.DeleteContext(ctx, msgID)
+		switch {
+		case err == nil:
 			deleted++
+		case mailCommandContextExpired(ctx, err):
+			errors = append(errors, fmt.Sprintf("%s: %v", msgID, mailCommandPhaseError(ctx, "deleting message", err)))
+			break deleteLoop
+		default:
+			errors = append(errors, fmt.Sprintf("%s: %v", msgID, err))
 		}
 	}
 
 	// Report results
 	if len(errors) > 0 {
-		fmt.Printf("%s Deleted %d/%d messages\n",
+		fmt.Fprintf(out, "%s Deleted %d/%d messages\n",
 			style.Bold.Render("⚠"), deleted, len(args))
 		for _, e := range errors {
-			fmt.Printf("  Error: %s\n", e)
+			fmt.Fprintf(out, "  Error: %s\n", e)
 		}
 		return fmt.Errorf("failed to delete %d messages", len(errors))
 	}
 
 	if len(args) == 1 {
-		fmt.Printf("%s Message deleted\n", style.Bold.Render("✓"))
+		fmt.Fprintf(out, "%s Message deleted\n", style.Bold.Render("✓"))
 	} else {
-		fmt.Printf("%s Deleted %d messages\n", style.Bold.Render("✓"), deleted)
+		fmt.Fprintf(out, "%s Deleted %d messages\n", style.Bold.Render("✓"), deleted)
 	}
 	return nil
 }

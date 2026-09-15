@@ -3,6 +3,7 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1545,6 +1546,122 @@ func TestBDListSlowListDoesNotBlockUnrelatedList(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		slowCancel()
 		t.Fatalf("slow bd list did not finish")
+	}
+}
+
+func TestShowContextCancelsBlockedBDSubprocess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake bd")
+	}
+
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(ResetBdAllowStaleCacheForTest)
+
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, ".gt-types-configured"), []byte(TypeConfigSentinelValue()+"\n"), 0644); err != nil {
+		t.Fatalf("write types sentinel: %v", err)
+	}
+
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "show-started")
+	stubPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+if [ "$1" = "show" ]; then
+  : > "$BD_SHOW_STARTED"
+  sleep 60
+  exit 0
+fi
+printf '[]\n'
+`
+	if err := os.WriteFile(stubPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_SHOW_STARTED", started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := New(workDir).ShowContext(ctx, "gt-slow")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("ShowContext returned nil, want cancellation error")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("context error = %v, want deadline exceeded", ctx.Err())
+	}
+	if elapsed > time.Second {
+		t.Fatalf("ShowContext took %s, want bounded by caller context", elapsed)
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("fake bd show was not invoked: %v", statErr)
+	}
+}
+
+func TestCloseContextCancelsSameDBBlockedBDSubprocess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake bd")
+	}
+
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(ResetBdAllowStaleCacheForTest)
+
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, ".gt-types-configured"), []byte(TypeConfigSentinelValue()+"\n"), 0644); err != nil {
+		t.Fatalf("write types sentinel: %v", err)
+	}
+
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "close-started")
+	stubPath := filepath.Join(binDir, "bd")
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+if [ "$1" = "close" ]; then
+  : > "$BD_CLOSE_STARTED"
+  sleep 60
+  exit 0
+fi
+printf '[]\n'
+`
+	if err := os.WriteFile(stubPath, []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_CLOSE_STARTED", started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := New(workDir).ForceCloseWithReasonContext(ctx, "done", "gt-slow")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("ForceCloseWithReasonContext returned nil, want cancellation error")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("context error = %v, want deadline exceeded", ctx.Err())
+	}
+	if elapsed > time.Second {
+		t.Fatalf("ForceCloseWithReasonContext took %s, want bounded by caller context", elapsed)
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("fake bd close was not invoked: %v", statErr)
 	}
 }
 

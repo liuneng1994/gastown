@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/beads"
@@ -170,6 +172,223 @@ esac
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return logPath
+}
+
+func TestFindActivePatrolContextCancelsChildLookup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake bd")
+	}
+
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	townRoot := setupRefinerySafetyStopTown(t)
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "query-started")
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+cmd="$1"
+case "$cmd" in
+  list)
+    case "$*" in
+      *--parent=gt-wisp-active*)
+        : > "$BD_QUERY_STARTED"
+        sleep 60
+        ;;
+      *)
+        printf '%s\n' '[]'
+        ;;
+    esac
+    ;;
+  query)
+    case "$*" in
+      *assignee=\"testrig/witness\"*)
+        printf '%s\n' '[{"id":"gt-wisp-active","title":"mol-witness-patrol (wisp)","status":"hooked","priority":2,"issue_type":"task","assignee":"testrig/witness","created_at":"2026-09-15T00:00:00Z","updated_at":"2026-09-15T00:00:00Z"}]'
+        ;;
+      *)
+        printf '%s\n' '[]'
+        ;;
+    esac
+    ;;
+  *)
+    printf 'unexpected bd args: %s\n' "$*" >&2
+    exit 1
+    ;;
+esac
+`, "")
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("BD_QUERY_STARTED", started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	cfg := PatrolConfig{
+		PatrolMolName: constants.MolWitnessPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "testrig/witness",
+	}
+
+	start := time.Now()
+	_, _, _, err := findActivePatrolContext(ctx, cfg)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("findActivePatrolContext returned nil, want cancellation error")
+	}
+	if !strings.Contains(err.Error(), "discovery incomplete") {
+		t.Fatalf("error = %v, want discovery incomplete phase", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("findActivePatrolContext took %s, want bounded by caller context", elapsed)
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("fake bd query was not invoked: %v", statErr)
+	}
+}
+
+func TestPatrolReportPhaseErrorIncludesCommandDeadline(t *testing.T) {
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+
+	err := patrolReportPhaseError(ctx, "closing patrol gt-wisp-active", context.DeadlineExceeded)
+	if err == nil {
+		t.Fatal("patrolReportPhaseError returned nil")
+	}
+	text := err.Error()
+	if !strings.Contains(text, "closing patrol gt-wisp-active timed out after") {
+		t.Fatalf("error = %v, want patrol phase timeout", err)
+	}
+	if !strings.Contains(text, patrolReportCommandTimeout.String()) {
+		t.Fatalf("error = %v, want command timeout %s", err, patrolReportCommandTimeout)
+	}
+}
+
+func TestRecoverMissingPatrolCreatesReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake gt/bd")
+	}
+
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	townRoot := setupRefinerySafetyStopTown(t)
+	binDir := t.TempDir()
+	logPath := filepath.Join(binDir, "commands.log")
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+printf 'bd:%s\n' "$*" >> "$GT_RECOVERY_LOG"
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+case "$*" in
+  *"mol wisp create"*)
+    printf '%s\n' 'Root issue: gt-wisp-recovered'
+    ;;
+  *)
+    printf '%s\n' '[]'
+    ;;
+esac
+`, "")
+	gtPath := filepath.Join(binDir, "gt")
+	gtScript := `#!/usr/bin/env sh
+printf 'gt:%s\n' "$*" >> "$GT_RECOVERY_LOG"
+if [ "$1" = "formula" ] && [ "$2" = "list" ]; then
+  printf '%s\n' 'mol-witness-patrol Witness patrol'
+  exit 0
+fi
+printf 'unexpected gt args: %s\n' "$*" >&2
+exit 1
+`
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write gt stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_RECOVERY_LOG", logPath)
+
+	var runErr error
+	stdout := captureStdout(t, func() {
+		runErr = recoverMissingPatrol(PatrolConfig{
+			RoleName:      "witness",
+			PatrolMolName: constants.MolWitnessPatrol,
+			BeadsDir:      townRoot,
+			Assignee:      "testrig/witness",
+		})
+	})
+	if runErr != nil {
+		t.Fatalf("recoverMissingPatrol: %v", runErr)
+	}
+	if !strings.Contains(stdout, "Recovered patrol: gt-wisp-recovered") {
+		t.Fatalf("stdout missing recovery result:\n%s", stdout)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read command log: %v", err)
+	}
+	log := string(logData)
+	if !strings.Contains(log, "gt:formula list") {
+		t.Fatalf("recovery did not inspect formula catalog:\n%s", log)
+	}
+	if !strings.Contains(log, "bd:mol wisp create mol-witness-patrol") {
+		t.Fatalf("recovery did not create replacement patrol:\n%s", log)
+	}
+	if !strings.Contains(log, "bd:update gt-wisp-recovered --status=hooked --assignee=testrig/witness") {
+		t.Fatalf("recovery did not hook replacement patrol:\n%s", log)
+	}
+}
+
+func TestAutoSpawnPatrolFormulaListContextKillsPipeHoldingChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX shell fake gt/bd")
+	}
+
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
+	townRoot := setupRefinerySafetyStopTown(t)
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "gt-started")
+	writeBDStub(t, binDir, `#!/usr/bin/env sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+printf '%s\n' '[]'
+`, "")
+	gtPath := filepath.Join(binDir, "gt")
+	gtScript := `#!/usr/bin/env sh
+if [ "$1" = "formula" ] && [ "$2" = "list" ]; then
+  : > "$GT_FORMULA_LIST_STARTED"
+  (sleep 60) &
+  wait
+fi
+`
+	if err := os.WriteFile(gtPath, []byte(gtScript), 0755); err != nil {
+		t.Fatalf("write gt stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GT_FORMULA_LIST_STARTED", started)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := autoSpawnPatrolContext(ctx, PatrolConfig{
+		RoleName:      "witness",
+		PatrolMolName: constants.MolWitnessPatrol,
+		BeadsDir:      townRoot,
+		Assignee:      "testrig/witness",
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("autoSpawnPatrolContext returned nil, want cancellation error")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("autoSpawnPatrolContext took %s, want process tree killed by caller context", elapsed)
+	}
+	if _, statErr := os.Stat(started); statErr != nil {
+		t.Fatalf("fake gt formula list was not invoked: %v", statErr)
+	}
 }
 
 func TestBuildRefineryPatrolVars_NilMergeQueue(t *testing.T) {

@@ -79,6 +79,20 @@ func storeCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
+func (b *Beads) defaultOperationContext() (context.Context, context.CancelFunc) {
+	if b != nil && b.store != nil {
+		return storeCtx()
+	}
+	return context.Background(), func() {}
+}
+
+func normalizeStoreCtx(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
 // sdkIssueToIssue converts a beadsdk Issue (types.Issue) to the gastown
 // beads.Issue type used throughout the gt codebase. This handles the type
 // differences between the two representations:
@@ -276,7 +290,11 @@ func workFilterFromListOpts(opts ListOptions) beadsdk.WorkFilter {
 func (b *Beads) storeList(opts ListOptions) ([]*Issue, error) {
 	ctx, cancel := storeCtx()
 	defer cancel()
+	return b.storeListContext(ctx, opts)
+}
 
+func (b *Beads) storeListContext(ctx context.Context, opts ListOptions) ([]*Issue, error) {
+	ctx = normalizeStoreCtx(ctx)
 	filter := issueFilterFromListOpts(opts)
 	sdkIssues, err := b.store.SearchIssues(ctx, "", filter)
 	if err != nil {
@@ -290,7 +308,11 @@ func (b *Beads) storeList(opts ListOptions) ([]*Issue, error) {
 func (b *Beads) storeShow(id string) (*Issue, error) {
 	ctx, cancel := storeCtx()
 	defer cancel()
+	return b.storeShowContext(ctx, id)
+}
 
+func (b *Beads) storeShowContext(ctx context.Context, id string) (*Issue, error) {
+	ctx = normalizeStoreCtx(ctx)
 	si, err := b.store.GetIssue(ctx, id)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
@@ -323,7 +345,15 @@ func (b *Beads) storeShowMultiple(ids []string) (map[string]*Issue, error) {
 
 	ctx, cancel := storeCtx()
 	defer cancel()
+	return b.storeShowMultipleContext(ctx, ids)
+}
 
+func (b *Beads) storeShowMultipleContext(ctx context.Context, ids []string) (map[string]*Issue, error) {
+	if len(ids) == 0 {
+		return make(map[string]*Issue), nil
+	}
+
+	ctx = normalizeStoreCtx(ctx)
 	sdkIssues, err := b.store.GetIssuesByIDs(ctx, ids)
 	if err != nil {
 		return nil, fmt.Errorf("store show multiple: %w", err)
@@ -403,7 +433,11 @@ func (b *Beads) storeCreate(opts CreateOptions) (*Issue, error) {
 func (b *Beads) storeUpdate(id string, opts UpdateOptions) error {
 	ctx, cancel := storeCtx()
 	defer cancel()
+	return b.storeUpdateContext(ctx, id, opts)
+}
 
+func (b *Beads) storeUpdateContext(ctx context.Context, id string, opts UpdateOptions) error {
+	ctx = normalizeStoreCtx(ctx)
 	updates := make(map[string]interface{})
 
 	if opts.Title != nil {
@@ -468,7 +502,11 @@ func (b *Beads) storeUpdate(id string, opts UpdateOptions) error {
 func (b *Beads) storeClose(reason, session string, ids ...string) error {
 	ctx, cancel := storeCtx()
 	defer cancel()
+	return b.storeCloseContext(ctx, reason, session, ids...)
+}
 
+func (b *Beads) storeCloseContext(ctx context.Context, reason, session string, ids ...string) error {
+	ctx = normalizeStoreCtx(ctx)
 	actor := b.getActor()
 
 	for _, id := range ids {

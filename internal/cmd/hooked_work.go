@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -13,20 +15,30 @@ import (
 // Hooked molecule roots can live in either table, so active-work readers must
 // explicitly merge both sources instead of relying on issue-only bd list output.
 func listBeadsAcrossTables(b *beads.Beads, opts beads.ListOptions) ([]*beads.Issue, error) {
+	return listBeadsAcrossTablesContext(context.Background(), b, opts)
+}
+
+func listBeadsAcrossTablesContext(ctx context.Context, b *beads.Beads, opts beads.ListOptions) ([]*beads.Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	limit := opts.Limit
 
 	issueOpts := opts
 	issueOpts.Ephemeral = false
 	issueOpts.Limit = 0
-	issues, err := b.List(issueOpts)
+	issues, err := b.ListContext(ctx, issueOpts)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	wispOpts := opts
 	wispOpts.Ephemeral = true
 	wispOpts.Limit = 0
-	wisps, err := b.List(wispOpts)
+	wisps, err := b.ListContext(ctx, wispOpts)
 	if err != nil {
 		return nil, err
 	}
@@ -39,8 +51,18 @@ func listBeadsAcrossTables(b *beads.Beads, opts beads.ListOptions) ([]*beads.Iss
 }
 
 func listAssignedActiveWork(b *beads.Beads, assignee string) ([]*beads.Issue, error) {
+	return listAssignedActiveWorkContext(context.Background(), b, assignee)
+}
+
+func listAssignedActiveWorkContext(ctx context.Context, b *beads.Beads, assignee string) ([]*beads.Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	for _, status := range activeWorkStatuses() {
-		beadsForStatus, err := listBeadsAcrossTables(b, beads.ListOptions{
+		beadsForStatus, err := listBeadsAcrossTablesContext(ctx, b, beads.ListOptions{
 			Status:   status,
 			Assignee: assignee,
 			Priority: -1,
@@ -56,9 +78,16 @@ func listAssignedActiveWork(b *beads.Beads, assignee string) ([]*beads.Issue, er
 }
 
 func listAssignedActiveWorkAcrossStatuses(b *beads.Beads, assignee string) ([]*beads.Issue, error) {
+	return listAssignedActiveWorkAcrossStatusesContext(context.Background(), b, assignee)
+}
+
+func listAssignedActiveWorkAcrossStatusesContext(ctx context.Context, b *beads.Beads, assignee string) ([]*beads.Issue, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var assigned []*beads.Issue
 	for _, status := range activeWorkStatuses() {
-		beadsForStatus, err := listBeadsAcrossTables(b, beads.ListOptions{
+		beadsForStatus, err := listBeadsAcrossTablesContext(ctx, b, beads.ListOptions{
 			Status:   status,
 			Assignee: assignee,
 			Priority: -1,
@@ -71,8 +100,45 @@ func listAssignedActiveWorkAcrossStatuses(b *beads.Beads, assignee string) ([]*b
 	return mergeBeadLists(assigned, nil), nil
 }
 
+func listHookedWorkWithFallbacksContext(ctx context.Context, b *beads.Beads, workDir, townRoot, target string) ([]*beads.Issue, error) {
+	hookedBeads, err := listAssignedActiveWorkContext(ctx, b, target)
+	if err != nil {
+		return nil, err
+	}
+	if len(hookedBeads) > 0 || townRoot == "" {
+		return hookedBeads, nil
+	}
+
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	if cleanedWorkDir, cleanedTown := filepath.Clean(workDir), filepath.Clean(townRoot); cleanedWorkDir != cleanedTown {
+		if _, err := os.Stat(townBeadsDir); err == nil {
+			townB := beads.New(townBeadsDir)
+			townWork, err := listAssignedActiveWorkContext(ctx, townB, target)
+			if err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+			} else if len(townWork) > 0 {
+				return townWork, nil
+			}
+		}
+	}
+
+	if isTownLevelRole(target) {
+		return scanAllRigsForHookedBeadsContext(ctx, townRoot, target), nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
 func listChildrenAcrossTables(b *beads.Beads, parentID string) ([]*beads.Issue, error) {
-	return listBeadsAcrossTables(b, beads.ListOptions{
+	return listChildrenAcrossTablesContext(context.Background(), b, parentID)
+}
+
+func listChildrenAcrossTablesContext(ctx context.Context, b *beads.Beads, parentID string) ([]*beads.Issue, error) {
+	return listBeadsAcrossTablesContext(ctx, b, beads.ListOptions{
 		Parent:   parentID,
 		Status:   "all",
 		Priority: -1,
