@@ -776,10 +776,8 @@ func (b *Beads) runWithStdin(stdinData []byte, args ...string) (_ []byte, retErr
 	// (which changes args[0] from "list" to "--allow-stale").
 	args = InjectFlatForListJSON(args)
 
-	// Conditionally use --allow-stale to prevent failures when db is temporarily stale
-	// (e.g., after daemon is killed during shutdown). Only if bd supports it.
 	beadsDir := b.getResolvedBeadsDir()
-	runEnv := append(b.buildRunEnv(), "BEADS_DIR="+beadsDir)
+	runEnv := b.buildCommandEnv(beadsDir, args)
 	fullArgs := MaybePrependAllowStaleWithEnv(runEnv, args)
 
 	// Bound the subprocess runtime so a slow Dolt response doesn't leave bd
@@ -955,6 +953,17 @@ func (b *Beads) buildRunEnv() []string {
 	// first-match-sensitive BEADS_DIR entries.
 	env := BuildPinnedBDEnv(os.Environ(), b.getResolvedBeadsDir())
 	env = StripEnvKey(env, "BEADS_DIR")
+	return env
+}
+
+func (b *Beads) buildCommandEnv(beadsDir string, args []string) []string {
+	env := b.buildRunEnv()
+	if beadsDir != "" {
+		env = append(env, "BEADS_DIR="+beadsDir)
+	}
+	if ArgsAreReadOnly(args) {
+		return forceBDReadOnly(env)
+	}
 	return env
 }
 
